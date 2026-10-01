@@ -1,4 +1,4 @@
-# Universal RTXMFG — v1.4
+# Universal RTXMFG Unlocker — v1.4
 
 DLSS Multi Frame Generation controls for Windows x64 games on RTX 40 series GPUs,
 with experimental RTX 30 support. The backend and menu are combined in one
