@@ -1,4 +1,4 @@
-# Universal RTXMFG Unlocker — v1.4
+# Universal RTXMFG Unlocker — v1.4.1
 
 DLSS Multi Frame Generation controls for Windows x64 games on RTX 40 series GPUs,
 with experimental RTX 30 support. The backend and menu are combined in one
@@ -13,6 +13,19 @@ MFG override maximum. A listed maximum does not guarantee that the active
 Frame Generation pipeline can apply it.
 
 If this mod helps you, [help me get through university on Ko-fi](https://ko-fi.com/dashdogy).
+
+## Changes in v1.4.1
+
+- **Refines path-traced HairWorks in The Witcher 3 on RTX 40.**
+- Fixes hair setting changes and save/reload behavior, and reduces per-frame
+  CPU overhead from hair processing.
+- Prevents unrelated overlay command lists from disabling path-traced hair
+  for the rest of the session, and improves hair resource cleanup.
+- Adds clearer hair activity and cost information to the menu and runtime log.
+- Fixes menu access in **Where Winds Meet** and input handling in the
+  **Microsoft Store version of Microsoft Flight Simulator 2024**.
+- Keeps the previous session's runtime log as `*.previous.log` to help diagnose
+  problems after a restart.
 
 ## Changes in v1.4
 
@@ -29,12 +42,12 @@ If this mod helps you, [help me get through university on Ko-fi](https://ko-fi.c
 
 ## Install
 
-The v1.4 download contains **`RTXMFG.dll`**. The menu is built in; no separate
+The v1.4.1 download contains **`RTXMFG.dll`**. The menu is built in; no separate
 ReShade or external loader installation is needed.
 
 1. Close the game. If upgrading from a split release, remove the old mod
    components as described below first.
-2. Download `RTXMFG-v1.4.0.zip` from [Releases](https://github.com/dashdogy/RTX40MFG-Unlock/releases)
+2. Download `RTXMFG-v1.4.1.zip` from [Releases](https://github.com/dashdogy/RTX40MFG-Unlock/releases)
    and extract it.
 3. Rename `RTXMFG.dll` to **one** supported filename below that the game loads
    early. Place it beside the **actual game executable**, not the launcher.
@@ -115,8 +128,12 @@ Check the status line for pending changes or restart instructions.
 path for supported Witcher 3 DirectX 12 builds, retaining the game's hair materials
 and shading while bringing animated strands into its path-traced lighting.
 
+For The Witcher 3 DirectX 12, install RTXMFG as **`winmm.dll`** beside
+`witcher3.exe`.
+
 Enable the game's HairWorks, path tracing and **Path Traced Hair** settings;
 RTXMFG follows those settings automatically.
+**Fully restart the game after changing Path Traced Hair or Frame Generation.**
 The mod menu's **Path traced hair** line shows its activity or why it is unavailable.
 Support is experimental and requires a matching game and hair shader profile.
 
@@ -140,7 +157,9 @@ changing presets. This is a reported workaround, not a fix for every game.
 For [bug reports](https://github.com/dashdogy/RTX40MFG-Unlock/issues), include
 the game, GPU, driver, proxy filename, multiplier and preset, plus the matching
 `%TEMP%\RTXMFG-<game>-<path-hash>.log` and `RTXMFG-Universal.status.json`
-beside the mod settings. Each launch replaces the previous log/status contents.
+beside the mod settings. Each launch keeps the previous runtime log as
+`%TEMP%\RTXMFG-<game>-<path-hash>.previous.log` and creates a new log.
+The status file is replaced on each launch.
 Optional interval tracing also reuses one file per game installation.
 
 ## Uninstall

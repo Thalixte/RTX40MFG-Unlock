@@ -2189,19 +2189,28 @@ void DrawWitcherDots()
             if(status.memoryKnown)
                 ImGui::Text("Game VRAM: %.2f of %.2f GiB budget | shared %.2f GiB",
                     status.vramUsage/gib,status.vramBudget/gib,status.sharedUsage/gib);
-            // DOTS CPU time per second, sampled once a second.
-            static uint64_t sampleTick=0,sampleMicroseconds=0;static double cpuMs=0;
+            // DOTS time per second by hook, sampled once a second.
+            static uint64_t sampleTick=0,sampleBuild=0,sampleCopy=0,sampleCalls=0,sampleInstances=0,sampleWait=0,sampleHeld=0;
+            static double buildMs=0,copyMs=0,callsPerSecond=0,instancesPerSecond=0,waitMs=0,heldMs=0;
             const uint64_t tick=GetTickCount64();
             if(!sampleTick||tick-sampleTick>=1000) {
-                if(sampleTick&&status.hookMicroseconds>=sampleMicroseconds)
-                    cpuMs=(status.hookMicroseconds-sampleMicroseconds)/1000.0*1000.0/static_cast<double>(tick-sampleTick);
-                sampleTick=tick;sampleMicroseconds=status.hookMicroseconds;
+                if(sampleTick) {
+                    const double seconds=(tick-sampleTick)/1000.0;
+                    buildMs=(status.buildMicroseconds-sampleBuild)/1000.0/seconds;copyMs=(status.copyMicroseconds-sampleCopy)/1000.0/seconds;
+                    callsPerSecond=(status.copyCalls-sampleCalls)/seconds;instancesPerSecond=(status.instancesScanned-sampleInstances)/seconds;
+                    waitMs=(status.buildLockWaitMicroseconds-sampleWait)/1000.0/seconds;heldMs=(status.buildLockHeldMicroseconds-sampleHeld)/1000.0/seconds;
+                }
+                sampleTick=tick;sampleBuild=status.buildMicroseconds;sampleCopy=status.copyMicroseconds;
+                sampleWait=status.buildLockWaitMicroseconds;sampleHeld=status.buildLockHeldMicroseconds;
+                sampleCalls=status.copyCalls;sampleInstances=status.instancesScanned;
             }
-            ImGui::Text("DOTS CPU %.2f ms/s | pool allocations %llu, releases %llu, returns %llu | full rebuilds %llu",cpuMs,
+            ImGui::Text("DOTS CPU: hair builds %.2f ms/s | instance copies %.2f ms/s (%.0f/s, %.0fk instances/s)",
+                buildMs,copyMs,callsPerSecond,instancesPerSecond/1000.0);
+            ImGui::Text("Hair builds: lock wait %.2f ms/s | under lock %.2f ms/s | other %.2f ms/s",
+                waitMs,heldMs,buildMs>waitMs+heldMs?buildMs-waitMs-heldMs:0.0);
+            ImGui::Text("Pool allocations %llu, releases %llu, returns %llu | full rebuilds %llu",
                 static_cast<unsigned long long>(status.poolAllocations),static_cast<unsigned long long>(status.poolReleases),
                 static_cast<unsigned long long>(status.poolReturns),static_cast<unsigned long long>(status.fullRebuilds));
-            if(status.declinedWhileOff)
-                ImGui::Text("Hair builds declined while the game setting was off: %llu",static_cast<unsigned long long>(status.declinedWhileOff));
             bool report=status.crashReportRequested;
             static bool reportSaveFailed=false;
             if(ImGui::Checkbox("GPU crash report (next launch)",&report))reportSaveFailed=!witcher_dots::SetCrashReportRequested(report);

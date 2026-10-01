@@ -8681,6 +8681,10 @@ DWORD WINAPI PatchWorker(void* context)
     const std::wstring logPath=diagnostic_paths::RuntimeLog();
     if (!logPath.empty())
     {
+        // Keep the previous session's log (a crashed session is usually
+        // followed by a relaunch) beside the new one as *.previous.log.
+        const std::wstring previousLog = logPath.substr(0, logPath.size() - 4) + L".previous.log";
+        MoveFileExW(logPath.c_str(), previousLog.c_str(), MOVEFILE_REPLACE_EXISTING);
         gLog = _wfsopen(logPath.c_str(), L"w, ccs=UTF-8", _SH_DENYWR);
     }
     gLogReady.store(gLog != nullptr, std::memory_order_release);
@@ -8744,7 +8748,7 @@ DWORD WINAPI PatchWorker(void* context)
     hudless_probe::SetLogSink(&MidpointLog);
     hudless_visualizer::SetUiTagger(&TagSynthesizedUi);
 #if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
-    Log(L"RTXMFG build=1.4.0 source=dev.30 outputPullMask=%d occupancyHint=%d "
+    Log(L"RTXMFG build=1.4.1 source=dev.43 outputPullMask=%d occupancyHint=%d "
         L"uiInputs=framed-observations uiRecomposition=game-managed "
         L"hudlessDetection=tile-probe",
         MFG_UNLOCK_OUTPUT_PULL_MASK_ONLY,

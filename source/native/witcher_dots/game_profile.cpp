@@ -34,31 +34,43 @@ bool ConfigVarMatches(const uint8_t* base,const IMAGE_NT_HEADERS64& nt,const Con
     return static_cast<int64_t>(var.reader)+7+displacement==var.value;
 }
 }
-bool ValidateMapped(HMODULE image,std::string& error) {
+bool KnownDeviceCaller(const void* caller,const void* image) noexcept {
+    for(const auto& game:kProfiles)for(const auto ret:game.deviceReturns)
+        if(caller==static_cast<const uint8_t*>(image)+ret)return true;
+    return false;
+}
+bool ValidateMapped(HMODULE image,const GameProfile& game,std::string& error) {
     const auto* base=reinterpret_cast<const uint8_t*>(image);
     IMAGE_DOS_HEADER dos{};IMAGE_NT_HEADERS64 nt{};
     if(!CopyChecked(&dos,base,sizeof(dos))||dos.e_magic!=IMAGE_DOS_SIGNATURE||dos.e_lfanew<=0||dos.e_lfanew>0x100000
         ||!CopyChecked(&nt,base+dos.e_lfanew,sizeof(nt))||nt.Signature!=IMAGE_NT_SIGNATURE
         ||nt.FileHeader.Machine!=IMAGE_FILE_MACHINE_AMD64||nt.OptionalHeader.Magic!=IMAGE_NT_OPTIONAL_HDR64_MAGIC
-        ||nt.OptionalHeader.SizeOfImage<0x35728c0) {error="live game PE layout mismatch";return false;}
-    for(const auto& entry:kEntries)if(!Matches(base,entry.rva,entry.before)) {error="game hook entry changed";return false;}
-    for(const auto& entry:kGates)if(!Matches(base,entry.rva,entry.before)) {error="game hair gate changed";return false;}
-    if(!Matches(base,kHairInstanceWriterRva,kHairInstanceWriter)||!Matches(base,kOrdinaryInstanceWriterRva,kOrdinaryInstanceWriter)) {
+        ||nt.OptionalHeader.SizeOfImage<game.minImageSize) {error="live game PE layout mismatch";return false;}
+    for(const auto& entry:game.entries)if(!Matches(base,entry.rva,entry.before)) {error="game hook entry changed";return false;}
+    for(const auto& entry:game.gates)if(!Matches(base,entry.rva,entry.before)) {error="game hair gate changed";return false;}
+    if(!Matches(base,game.hairWriterRva,game.hairWriter)||!Matches(base,game.ordinaryWriterRva,game.ordinaryWriter)) {
         error="game instance-mask layout changed";return false;
     }
-    for(const uint32_t ret:{0x1ec4889u,0x1ec48c2u}) {
+    for(const uint32_t ret:game.deviceReturns) {
         std::array<uint8_t,6> call{};int32_t displacement{};
         if(!CopyChecked(call.data(),base+ret-6,call.size())||call[0]!=0xff||call[1]!=0x15) {error="renderer device caller changed";return false;}
         memcpy(&displacement,call.data()+2,4);
-        if(static_cast<int64_t>(ret)+displacement!=0x298dcb0) {error="renderer device import target changed";return false;}
+        if(static_cast<int64_t>(ret)+displacement!=game.deviceImport) {error="renderer device import target changed";return false;}
     }
-    for(const auto [ret,target]:std::array<std::pair<uint32_t,uint32_t>,3>{{{0x280f676,0x7cf00},{0x280f9a4,0x7cfd0},{0x1f0b139,0x367890}}}) {
+    // Each hooked hair operation is called from exactly this site and to the
+    // entry the hook is installed on (prebuild, build, instance copy).
+    if(game.hairCalls[0].target!=game.entries[1].rva||game.hairCalls[1].target!=game.entries[2].rva
+        ||game.hairCalls[2].target!=game.entries[3].rva) {error="hair operation profile inconsistent";return false;}
+    for(const auto [ret,target]:game.hairCalls) {
         std::array<uint8_t,5> call{};int32_t displacement{};
         if(!CopyChecked(call.data(),base+ret-5,call.size())||call[0]!=0xe8) {error="hair operation caller changed";return false;}
         memcpy(&displacement,call.data()+1,4);
         if(static_cast<int64_t>(ret)+displacement!=target) {error="hair operation target changed";return false;}
     }
-    if(!ConfigVarMatches(base,nt,kPtEnable)||!ConfigVarMatches(base,nt,kPtHairQuality)) {error="game path-traced hair setting layout changed";return false;}
+    if(game.gates.empty()||game.owner.size<std::max({game.owner.scratch,game.owner.blas,game.owner.positions,game.owner.indices})+8) {
+        error="game profile incomplete";return false;
+    }
+    if(!ConfigVarMatches(base,nt,game.ptEnable)||!ConfigVarMatches(base,nt,game.ptHairQuality)) {error="game path-traced hair setting layout changed";return false;}
     return true;
 }
 protected_pointer::PublishResult ReplaceGate(uintptr_t base,const Patch& patch,bool rollback) noexcept {

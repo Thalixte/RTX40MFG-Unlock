@@ -11,8 +11,10 @@ struct Snapshot {
     LUID luid{};
     uint64_t prebuilds{},builds{},updates{},rejected{},shaderLibraries{},instanceCopies{},geometryBytes{};
     uint64_t lastBuildAgeMs{UINT64_MAX},lastHairAgeMs{UINT64_MAX},evictions{};
-    uint64_t poolAllocations{},poolReleases{},poolReturns{},fullRebuilds{},declinedWhileOff{},hairBlasBytes{},hairScratchBytes{};
-    uint64_t hookMicroseconds{}; // CPU time spent in DOTS hair hooks since launch
+    uint64_t poolAllocations{},poolReleases{},poolReturns{},fullRebuilds{},hairBlasBytes{},hairScratchBytes{};
+    uint64_t buildMicroseconds{},copyMicroseconds{}; // time in DOTS's own hook work since launch
+    uint64_t buildLockWaitMicroseconds{},buildLockHeldMicroseconds{}; // parts of buildMicroseconds
+    uint64_t copyCalls{},instancesScanned{};          // game TLAS instance copies DOTS inspected
     uint64_t vramUsage{},vramBudget{},sharedUsage{}; // this process on the game's adapter
     uint32_t liveOwners{},hairInstances{};
     bool crashReportRequested{},crashReportArmed{},gameHairTraced{},memoryKnown{};

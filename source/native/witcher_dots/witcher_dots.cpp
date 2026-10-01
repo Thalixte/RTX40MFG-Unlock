@@ -10,6 +10,7 @@
 #include <intrin.h>
 #include <array>
 #include <atomic>
+#include <climits>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -27,8 +28,6 @@ struct State {
     ComPtr<ID3D12Device5> device;
     ComPtr<IUnknown> identity;
     ShaderCache shaders;
-    std::mutex instanceLock;
-    std::vector<D3D12_RAYTRACING_INSTANCE_DESC> instanceWorkspace;
     std::vector<ComPtr<IUnknown>> deviceAliasRefs;
     ComPtr<IDXGIAdapter3> memoryAdapter;
     DXGI_QUERY_VIDEO_MEMORY_INFO local{},shared{};
@@ -43,37 +42,192 @@ std::atomic<bool> converted{};
 // Wrapper pointers proven to front the prepared device (kept alive in State).
 std::array<std::atomic<void*>,4> deviceAliases{};
 std::atomic<bool> settingKnown{};
-std::atomic<uint64_t> declinedWhileOff{},hookTicks{};
+std::atomic<const profile::GameProfile*> gameProfile{};
+std::atomic<uint64_t> buildTicks{},copyTicks{},copyCalls{},instancesScanned{};
+// Diagnostics: the game's hair builder (its own work and DOTS's hooks inside
+// it), hair prebuild/build calls, and the longest gap between instance copies
+// (the game copies its TLAS instances every frame).
+std::atomic<uint64_t> builderCalls{},builderTicks{},prebuildCalls{},buildCalls{};
+std::atomic<int64_t> lastCopyQpc{},copyGapMax{};
+// Where the builder's wall time goes: before the prebuild hook, between the
+// hooks, after the build hook, and inside DOTS's two hooks; the CPU cycles its
+// thread actually executed (QueryThreadCycleTime, TSC reference cycles); which
+// threads run it and at what priority; and the busy share of the thread that
+// copies TLAS instances (the game's render thread), sampled when it logs.
+std::atomic<uint64_t> builderSampled{},builderPreTicks{},builderMidTicks{},builderPostTicks{},builderHookTicks{},builderCycles{};
+std::atomic<uint64_t> builderOnCopyThread{},builderGateTicks{}; // gate: DOTS's own owner/context checks before the builder
+std::atomic<uint32_t> copyThread{},builderThreadOverflow{};
+std::array<std::atomic<uint32_t>,16> builderThreads{};
+std::atomic<int> builderPriorityMin{INT_MAX},builderPriorityMax{INT_MIN};
+std::atomic<uint64_t> tscOrigin{};std::atomic<int64_t> qpcOrigin{};
 std::atomic<int> loggedSetting{-1};
 std::atomic<uint32_t> settingLogs{};
 // When the setting returns mid-game the game recreates all of its hair, in
 // more than one burst; hair re-enters ray tracing once that has settled.
 constexpr uint64_t kSettleMs=2000;
 std::atomic<uint64_t> traceAfterTick{};
+int64_t QpcNow() noexcept {LARGE_INTEGER value{};QueryPerformanceCounter(&value);return value.QuadPart;}
 struct HookTimer {
-    LARGE_INTEGER start{};
-    HookTimer() noexcept {QueryPerformanceCounter(&start);}
-    ~HookTimer() {LARGE_INTEGER end{};QueryPerformanceCounter(&end);hookTicks.fetch_add(static_cast<uint64_t>(end.QuadPart-start.QuadPart),std::memory_order_relaxed);}
+    std::atomic<uint64_t>& total;LARGE_INTEGER start{};
+    explicit HookTimer(std::atomic<uint64_t>& counter) noexcept:total(counter) {QueryPerformanceCounter(&start);}
+    ~HookTimer() {LARGE_INTEGER end{};QueryPerformanceCounter(&end);total.fetch_add(static_cast<uint64_t>(end.QuadPart-start.QuadPart),std::memory_order_relaxed);}
 };
+uint64_t Microseconds(uint64_t ticks) noexcept {
+    LARGE_INTEGER frequency{};
+    if(!QueryPerformanceFrequency(&frequency)||frequency.QuadPart<=0)return 0;
+    const uint64_t hz=static_cast<uint64_t>(frequency.QuadPart);
+    return ticks/hz*1000000+ticks%hz*1000000/hz;
+}
 // The game's own Path Traced Hair state (profile-validated config variables).
 // Off: DOTS declines hair builds and keeps hair out of ray tracing, so
 // HairWorks behaves as on a stock RTX 40 series GPU.
 bool GameHairTraced() noexcept {
     if(!settingKnown.load(std::memory_order_acquire))return false;
     const auto* base=reinterpret_cast<const std::byte*>(S().game);
-    return *reinterpret_cast<const volatile uint8_t*>(base+profile::kPtEnable.value)!=0
-        &&*reinterpret_cast<const volatile int32_t*>(base+profile::kPtHairQuality.value)>0;
+    const auto* game=gameProfile.load(std::memory_order_acquire);
+    return game&&*reinterpret_cast<const volatile uint8_t*>(base+game->ptEnable.value)!=0
+        &&*reinterpret_cast<const volatile int32_t*>(base+game->ptHairQuality.value)>0;
 }
 bool HairTracedNow() noexcept {
     const bool on=GameHairTraced();const int value=on?1:0;
     const int previous=loggedSetting.exchange(value,std::memory_order_relaxed);
     if(previous==value)return on;
+    NoteSettingChange(on);
     if(on&&previous==0)traceAfterTick.store(GetTickCount64()+kSettleMs,std::memory_order_relaxed);
     if(settingLogs.fetch_add(1,std::memory_order_relaxed)<32)
         single_module::Log(on?(previous==0?L"WITCHER_DOTS game Path Traced Hair on: converting hair; ray tracing hair after 2 s"
                 :L"WITCHER_DOTS game Path Traced Hair on: converting hair")
-            :L"WITCHER_DOTS game Path Traced Hair off: hair builds declined, HairWorks stays raster");
+            :L"WITCHER_DOTS game Path Traced Hair off: the game builds no hair BLAS, HairWorks stays raster");
     return on;
+}
+// One cost line per 30 s (bounded), so a tester's log shows where DOTS spends time.
+std::atomic<uint64_t> nextCostLog{};
+std::atomic<uint32_t> costLogs{};
+void LogCost() noexcept {
+    const uint64_t now=GetTickCount64();uint64_t due=nextCostLog.load(std::memory_order_relaxed);
+    if(!due) {nextCostLog.compare_exchange_strong(due,now+30000);return;}
+    if(now<due||!nextCostLog.compare_exchange_strong(due,now+30000)||costLogs.fetch_add(1,std::memory_order_relaxed)>=240)return;
+    static uint64_t lastTick,lastBuild,lastCopy,lastCalls,lastInstances,lastWait,lastHeld,lastTables,lastTableUs; // Only the CAS winner reaches here.
+    const uint64_t build=Microseconds(buildTicks.load()),copy=Microseconds(copyTicks.load());
+    const auto stats=ReadRuntimeStats();
+    const uint64_t wait=Microseconds(stats.buildLockWaitTicks),held=Microseconds(stats.buildLockHeldTicks);
+    const uint64_t calls=copyCalls.load(),instances=instancesScanned.load();
+    const uint64_t tableUs=Microseconds(stats.tableChangeTicks);
+    // Dedicated video memory against the OS budget: past it the game's
+    // resources page over PCIe (low GPU use on smaller cards).
+    DXGI_QUERY_VIDEO_MEMORY_INFO local{};bool vram=false;
+    {
+        ComPtr<IDXGIAdapter3> adapter;{std::lock_guard lock(S().lock);adapter=S().memoryAdapter;}
+        vram=adapter&&SUCCEEDED(adapter->QueryVideoMemoryInfo(0,DXGI_MEMORY_SEGMENT_GROUP_LOCAL,&local));
+    }
+    const double seconds=lastTick?(now-lastTick)/1000.0:30.0;
+    wchar_t line[640]{};
+    swprintf_s(line,L"WITCHER_DOTS cost window=%.0fs buildMsPerS=%.2f (lockWait=%.2f underLock=%.2f) builds=%llu copyMsPerS=%.2f copiesPerS=%.0f instancesPerS=%.0f hairTraced=%d lists=%u releasedLists=%llu roots=%u releasedRoots=%llu tableChanges=%llu tableMs=%.1f tableFailures=%llu vramMiB=%lld/%lld",
+        seconds,(build-lastBuild)/1000.0/seconds,(wait-lastWait)/1000.0/seconds,(held-lastHeld)/1000.0/seconds,
+        static_cast<unsigned long long>(stats.builds),(copy-lastCopy)/1000.0/seconds,(calls-lastCalls)/seconds,(instances-lastInstances)/seconds,
+        GameHairTraced()?1:0,stats.trackedLists,static_cast<unsigned long long>(stats.releasedLists),
+        stats.trackedRoots,static_cast<unsigned long long>(stats.releasedRoots),
+        static_cast<unsigned long long>(stats.tableChanges-lastTables),(tableUs-lastTableUs)/1000.0,static_cast<unsigned long long>(stats.tableFailures),
+        vram?static_cast<long long>(local.CurrentUsage>>20):-1ll,vram?static_cast<long long>(local.Budget>>20):-1ll);
+    single_module::Log(line);
+    lastTick=now;lastBuild=build;lastCopy=copy;lastCalls=calls;lastInstances=instances;lastWait=wait;lastHeld=held;
+    lastTables=stats.tableChanges;lastTableUs=tableUs;
+}
+// One diagnostic line per 10 s (bounded, 2 h): whether DOTS sits on the game's
+// critical path. listOverheadNs is DOTS's own work per instrumented list call
+// (sampled, timer cost removed), runtimeNs the runtime/driver call itself;
+// builderMsPerS is the game's whole hair build including DOTS's hooks.
+std::atomic<uint64_t> nextDiagLog{};
+std::atomic<uint32_t> diagLogs{};
+void LogDiagnostics() noexcept {
+    const uint64_t now=GetTickCount64();uint64_t due=nextDiagLog.load(std::memory_order_relaxed);
+    static uint64_t lastTick; // Only a CAS winner reaches the statics; windows are 10 s apart.
+    static RuntimeStats last{};
+    static uint64_t lastBuilderCalls,lastBuilderUs,lastPrebuilds,lastBuildCalls,lastCopies,lastBuildUs,lastCopyUs,lastGateUs;
+    const auto remember=[&](const RuntimeStats& stats) {
+        lastTick=now;last=stats;lastBuilderCalls=builderCalls.load(std::memory_order_relaxed);
+        lastBuilderUs=Microseconds(builderTicks.load(std::memory_order_relaxed));
+        lastPrebuilds=prebuildCalls.load(std::memory_order_relaxed);lastBuildCalls=buildCalls.load(std::memory_order_relaxed);
+        lastCopies=copyCalls.load(std::memory_order_relaxed);lastBuildUs=Microseconds(buildTicks.load(std::memory_order_relaxed));
+        lastCopyUs=Microseconds(copyTicks.load(std::memory_order_relaxed));lastGateUs=Microseconds(builderGateTicks.load(std::memory_order_relaxed));
+    };
+    if(!due) {
+        if(nextDiagLog.compare_exchange_strong(due,now+10000)) {remember(ReadRuntimeStats());copyGapMax.store(0,std::memory_order_relaxed);}
+        return;
+    }
+    if(now<due||!nextDiagLog.compare_exchange_strong(due,now+10000)||diagLogs.fetch_add(1,std::memory_order_relaxed)>=720)return;
+    const auto stats=ReadRuntimeStats();
+    LARGE_INTEGER frequency{};QueryPerformanceFrequency(&frequency);
+    const double tickNs=frequency.QuadPart>0?1e9/static_cast<double>(frequency.QuadPart):0.0;
+    const double seconds=lastTick?(now-lastTick)/1000.0:10.0;
+    const uint64_t calls=stats.listCalls-last.listCalls,samples=stats.listSamples-last.listSamples;
+    const double overheadTicks=static_cast<double>(stats.listOverheadTicks-last.listOverheadTicks)-2.0*stats.qpcCostTicks*samples;
+    const double overheadNs=samples?std::max(0.0,overheadTicks)*tickNs/samples:0.0;
+    const double runtimeNs=samples?static_cast<double>(stats.listOriginalTicks-last.listOriginalTicks)*tickNs/samples:0.0;
+    const double listMs=overheadNs*calls/1e6/seconds;
+    const double executeMs=static_cast<double>(stats.executeOverheadTicks-last.executeOverheadTicks)*tickNs/1e6/seconds;
+    const uint64_t builders=builderCalls.load(std::memory_order_relaxed),builderUs=Microseconds(builderTicks.load(std::memory_order_relaxed));
+    const uint64_t prebuilds=prebuildCalls.load(std::memory_order_relaxed),builds=buildCalls.load(std::memory_order_relaxed);
+    const uint64_t copies=copyCalls.load(std::memory_order_relaxed);
+    const uint64_t buildUs=Microseconds(buildTicks.load(std::memory_order_relaxed)),copyUs=Microseconds(copyTicks.load(std::memory_order_relaxed));
+    const uint64_t gateUs=Microseconds(builderGateTicks.load(std::memory_order_relaxed));
+    const double hooksMs=((buildUs-lastBuildUs)+(copyUs-lastCopyUs)+(gateUs-lastGateUs))/1000.0/seconds;
+    const int64_t gapTicks=copyGapMax.exchange(0,std::memory_order_relaxed);
+    const uint64_t converted=stats.builds-last.builds,updates=stats.updates-last.updates;
+    wchar_t line[1200]{}; // Truncating: an unexpected value never reaches the invalid-parameter handler.
+    _snwprintf_s(line,_TRUNCATE,L"WITCHER_DOTS diag window=%.0fs dotsMsPerS=%.2f (hooks=%.2f list=%.2f execute=%.3f) listCallsPerS=%.0f listOverheadNs=%.1f listRuntimeNs=%.0f listOutliers=%llu "
+        L"executesPerS=%.0f listsPerS=%.0f hairExecutesPerS=%.1f builderPerS=%.1f builderMsPerS=%.2f prebuildsPerS=%.1f buildsPerS=%.1f "
+        L"convertedFullPerS=%.1f convertedUpdatesPerS=%.1f rejectsPerS=%.1f rebuilds=%llu evictions=%llu owners=%u hairAsMiB=%.1f scratchMiB=%.1f "
+        L"poolMiB=%.1f copiesPerS=%.1f copyGapMaxMs=%.1f traced=%d lost=%d",
+        seconds,hooksMs+listMs+executeMs,hooksMs,listMs,executeMs,calls/seconds,overheadNs,runtimeNs,
+        static_cast<unsigned long long>(stats.listOutliers-last.listOutliers),
+        (stats.executeCalls-last.executeCalls)/seconds,(stats.executeLists-last.executeLists)/seconds,(stats.executeHair-last.executeHair)/seconds,
+        (builders-lastBuilderCalls)/seconds,(builderUs-lastBuilderUs)/1000.0/seconds,(prebuilds-lastPrebuilds)/seconds,(builds-lastBuildCalls)/seconds,
+        (converted-updates)/seconds,updates/seconds,(stats.rejected-last.rejected)/seconds,
+        static_cast<unsigned long long>(stats.fullRebuilds-last.fullRebuilds),static_cast<unsigned long long>(stats.evictions-last.evictions),
+        stats.liveOwners,stats.hairBlasBytes/1048576.0,stats.hairScratchBytes/1048576.0,stats.geometryBytes/1048576.0,
+        (copies-lastCopies)/seconds,gapTicks*tickNs/1e6,GameHairTraced()?1:0,stats.lost?1:0);
+    single_module::Log(line);
+    // Builder detail. Called from the instance copy, so this thread is the one
+    // copying TLAS instances; its executed cycles give its busy share.
+    {
+        static uint64_t lastSampled,lastPre,lastMid,lastPost,lastHook,lastCycles,lastOnCopy,lastThreadCycles;static DWORD lastThread;
+        const uint64_t sampled=builderSampled.load(std::memory_order_relaxed),pre=builderPreTicks.load(std::memory_order_relaxed);
+        const uint64_t mid=builderMidTicks.load(std::memory_order_relaxed),post=builderPostTicks.load(std::memory_order_relaxed);
+        const uint64_t hook=builderHookTicks.load(std::memory_order_relaxed),cycles=builderCycles.load(std::memory_order_relaxed);
+        const uint64_t onCopy=builderOnCopyThread.load(std::memory_order_relaxed);
+        double tscHz=0.0;
+        if(const int64_t origin=qpcOrigin.load(std::memory_order_relaxed);origin&&frequency.QuadPart>0) {
+            const double elapsed=static_cast<double>(QpcNow()-origin)/static_cast<double>(frequency.QuadPart);
+            if(elapsed>1.0)tscHz=static_cast<double>(__rdtsc()-tscOrigin.load(std::memory_order_relaxed))/elapsed;
+        }
+        ULONG64 threadCycles{};QueryThreadCycleTime(GetCurrentThread(),&threadCycles);const DWORD thread=GetCurrentThreadId();
+        const double threadBusy=tscHz>0&&lastThread==thread&&threadCycles>lastThreadCycles
+            ?100.0*static_cast<double>(threadCycles-lastThreadCycles)/tscHz/seconds:-1.0;
+        uint32_t threads=0;
+        for(auto& slot:builderThreads)if(slot.exchange(0,std::memory_order_relaxed))++threads;
+        const uint32_t overflow=builderThreadOverflow.exchange(0,std::memory_order_relaxed);
+        const int low=builderPriorityMin.exchange(INT_MAX,std::memory_order_relaxed),high=builderPriorityMax.exchange(INT_MIN,std::memory_order_relaxed);
+        const uint64_t calls=sampled-lastSampled;
+        const auto ms=[&](uint64_t ticks) {return static_cast<double>(ticks)*tickNs/1e6/seconds;};
+        _snwprintf_s(line,_TRUNCATE,L"WITCHER_DOTS diag builder calls=%llu dotsGateMsPerS=%.3f wallMsPerS=%.2f (beforePrebuild=%.2f dotsHooks=%.2f between=%.2f afterBuild=%.2f) "
+            L"cpuMsPerS=%.2f threads=%u%s onCopyThread=%.0f%% priority=%d..%d copyThreadBusy=%.0f%% tscMHz=%.0f",
+            static_cast<unsigned long long>(calls),(gateUs-lastGateUs)/1000.0/seconds,ms((pre-lastPre)+(hook-lastHook)+(mid-lastMid)+(post-lastPost)),ms(pre-lastPre),ms(hook-lastHook),
+            ms(mid-lastMid),ms(post-lastPost),tscHz>0?static_cast<double>(cycles-lastCycles)/tscHz*1000.0/seconds:-1.0,
+            threads,overflow?L"+":L"",calls?100.0*static_cast<double>(onCopy-lastOnCopy)/static_cast<double>(calls):0.0,
+            calls?low:0,calls?high:0,threadBusy,tscHz/1e6);
+        single_module::Log(line);
+        lastSampled=sampled;lastPre=pre;lastMid=mid;lastPost=post;lastHook=hook;lastCycles=cycles;lastOnCopy=onCopy;
+        lastThreadCycles=threadCycles;lastThread=thread;
+    }
+    lastTick=now;last=stats;lastBuilderCalls=builders;lastBuilderUs=builderUs;lastPrebuilds=prebuilds;lastBuildCalls=builds;
+    lastCopies=copies;lastBuildUs=buildUs;lastCopyUs=copyUs;lastGateUs=gateUs;
+    static std::atomic_flag legend=ATOMIC_FLAG_INIT;
+    if(!legend.test_and_set()) {
+        _snwprintf_s(line,_TRUNCATE,L"WITCHER_DOTS diag timer cost=%.1f ns per QueryPerformanceCounter (removed from listOverheadNs); one list call in 32 per thread is timed",
+            stats.qpcCostTicks*tickNs);
+        single_module::Log(line);
+    }
 }
 using BuilderFn=int32_t(WINAPI*)(void*,const void*);
 using PrebuildFn=int32_t(WINAPI*)(ID3D12Device5*,const PrebuildParams*);
@@ -82,8 +236,63 @@ using CopyFn=uintptr_t(WINAPI*)(void*,const void*,size_t);
 BuilderFn originalBuilder{};PrebuildFn originalPrebuild{};BuildFn originalBuild{};CopyFn originalCopy{};
 std::array<void*,4> gameTargets{};
 std::array<bool,4> gameEnabled{};
-struct OwnerScope {void* owner{};ID3D12GraphicsCommandList4* list{};bool havePrebuild{};};
+struct OwnerScope {
+    void* owner{};ID3D12GraphicsCommandList4* list{};bool havePrebuild{};
+    int64_t prebuildIn{},prebuildOut{},buildIn{},buildOut{}; // QPC marks set by the hair hooks (diagnostics)
+};
 thread_local OwnerScope* ownerScope{};
+// Marks a hair hook's entry and exit in the current builder scope.
+class HookMarks {
+    int64_t* out{};
+public:
+    HookMarks(int64_t OwnerScope::* in,int64_t OwnerScope::* exit) noexcept {
+        if(auto* scope=ownerScope) {scope->*in=QpcNow();out=&(scope->*exit);}
+    }
+    ~HookMarks() {if(out)*out=QpcNow();}
+    HookMarks(const HookMarks&)=delete;HookMarks& operator=(const HookMarks&)=delete;
+};
+// One builder call in the hair path: wall-time segments, executed cycles,
+// thread identity and priority.
+class BuilderSample {
+    const OwnerScope& scope;int64_t entry{};ULONG64 cycles{};
+public:
+    explicit BuilderSample(const OwnerScope& s) noexcept:scope(s) {
+        int64_t expected=0;
+        if(!qpcOrigin.load(std::memory_order_relaxed)) {
+            const uint64_t tsc=__rdtsc();const int64_t qpc=QpcNow();
+            if(qpcOrigin.compare_exchange_strong(expected,qpc))tscOrigin.store(tsc,std::memory_order_relaxed);
+        }
+        QueryThreadCycleTime(GetCurrentThread(),&cycles);entry=QpcNow();
+    }
+    ~BuilderSample() {
+        const int64_t exit=QpcNow();ULONG64 end{};QueryThreadCycleTime(GetCurrentThread(),&end);
+        const auto add=[](std::atomic<uint64_t>& total,int64_t ticks) {if(ticks>0)total.fetch_add(static_cast<uint64_t>(ticks),std::memory_order_relaxed);};
+        builderSampled.fetch_add(1,std::memory_order_relaxed);
+        if(end>cycles)builderCycles.fetch_add(end-cycles,std::memory_order_relaxed);
+        if(scope.prebuildIn) {
+            add(builderPreTicks,scope.prebuildIn-entry);add(builderHookTicks,scope.prebuildOut-scope.prebuildIn);
+            if(scope.buildIn) {
+                add(builderMidTicks,scope.buildIn-scope.prebuildOut);add(builderHookTicks,scope.buildOut-scope.buildIn);
+                add(builderPostTicks,exit-scope.buildOut);
+            } else add(builderPostTicks,exit-scope.prebuildOut);
+        } else add(builderPreTicks,exit-entry);
+        const DWORD thread=GetCurrentThreadId();
+        if(thread==copyThread.load(std::memory_order_relaxed))builderOnCopyThread.fetch_add(1,std::memory_order_relaxed);
+        bool recorded=false;
+        for(auto& slot:builderThreads) {
+            uint32_t seen=slot.load(std::memory_order_relaxed);
+            if(seen==thread) {recorded=true;break;}
+            if(!seen&&slot.compare_exchange_strong(seen,thread,std::memory_order_relaxed)) {recorded=true;break;}
+            if(seen==thread) {recorded=true;break;}
+        }
+        if(!recorded)builderThreadOverflow.fetch_add(1,std::memory_order_relaxed);
+        const int priority=GetThreadPriority(GetCurrentThread());
+        int low=builderPriorityMin.load(std::memory_order_relaxed),high=builderPriorityMax.load(std::memory_order_relaxed);
+        while(priority<low&&!builderPriorityMin.compare_exchange_weak(low,priority,std::memory_order_relaxed)) {}
+        while(priority>high&&!builderPriorityMax.compare_exchange_weak(high,priority,std::memory_order_relaxed)) {}
+    }
+    BuilderSample(const BuilderSample&)=delete;BuilderSample& operator=(const BuilderSample&)=delete;
+};
 void Preferences() {
     auto& state=S();if(state.preferencesRead)return;state.preferencesRead=true;
     std::wstring path(32768,L'\0');
@@ -138,6 +347,8 @@ void ConversionSucceeded() {
     strcpy_s(state.snapshot.reason,text);
 }
 bool At(const void* caller,uint32_t rva) {return caller==reinterpret_cast<const std::byte*>(S().game)+rva;}
+// The identified build's profile (set once by VerifyProfile, before any hook).
+const profile::GameProfile& Game() {return *gameProfile.load(std::memory_order_acquire);}
 bool DeviceMatches(ID3D12Device5* device) {
     if(!device)return false;
     for(const auto& alias:deviceAliases)if(alias.load(std::memory_order_acquire)==device)return true;
@@ -151,39 +362,63 @@ bool DeviceMatches(ID3D12Device5* device) {
     }
     return true;
 }
+// The builder runs for every hair owner every frame, mostly on the render
+// thread. VirtualQuery sizes the region by walking its page-table entries:
+// in the game's large heap regions that cost 1.2 ms per call in play and 5 ms
+// after a save load (about 60% of a core, starving the GPU; dev.40/41). The
+// owner range (under a page) is instead probed under a structured-exception
+// guard: reading its first and last fields proves both pages it can touch are
+// committed and readable. Owners are game heap objects passed by the game's
+// own builder, and every later owner read is guarded the same way (ReadFast).
+bool OwnerReadable(const void* owner,size_t size) noexcept {
+    if(size<8||size>4096)return Readable(owner,size);
+    uint64_t first{},last{};
+    return owner&&!(reinterpret_cast<uintptr_t>(owner)&7)&&ReadFast(owner,0,first)&&ReadFast(owner,size-8,last);
+}
 int32_t WINAPI Builder(void* owner,const void* context) {
     if(!active.load(std::memory_order_acquire))return originalBuilder(owner,context);
+    builderCalls.fetch_add(1,std::memory_order_relaxed);HookTimer builder(builderTicks);
     uint32_t version{};ID3D12GraphicsCommandList4* list{};
-    if(!Readable(owner,0x570)||!Read(context,0,version)||version!=0x201||!Read(context,8,list)||!list)
-        return originalBuilder(owner,context);
+    bool accepted{};
+    {
+        HookTimer gate(builderGateTicks);
+        accepted=OwnerReadable(owner,Game().owner.size)&&ReadFast(context,0,version)&&version==0x201&&ReadFast(context,8,list)&&list;
+    }
+    if(!accepted)return originalBuilder(owner,context);
     OwnerScope scope{owner,list,false};const auto previous=ownerScope;ownerScope=&scope;
     struct RestoreScope {OwnerScope* previous;~RestoreScope(){ownerScope=previous;}} restore{previous};
+    BuilderSample sample(scope);
     return originalBuilder(owner,context);
 }
 int32_t WINAPI Prebuild(ID3D12Device5* device,const PrebuildParams* supplied) try {
-    if(!active.load(std::memory_order_acquire)||!At(_ReturnAddress(),0x280f676))return originalPrebuild(device,supplied);
-    HookTimer timer;
-    if(!HairTracedNow()) {declinedWhileOff.fetch_add(1,std::memory_order_relaxed);return -1;}
+    if(!active.load(std::memory_order_acquire)||!At(_ReturnAddress(),Game().hairCalls[0].ret))return originalPrebuild(device,supplied);
+    HookTimer timer(buildTicks);prebuildCalls.fetch_add(1,std::memory_order_relaxed);
+    HookMarks marks(&OwnerScope::prebuildIn,&OwnerScope::prebuildOut);
+    // The game asks for hair only when its own predicate says so; converting
+    // what it asks avoids leaving hair in its raster fallback across a load or
+    // a settings change. The setting is read only for status and logging.
+    HairTracedNow();
     PrebuildParams params{};ExtendedInputs inputs{};HairInput hair;std::string error;
-    if(!ownerScope||!DeviceMatches(device)||!CopyChecked(&params,supplied,sizeof(params))||params.version!=0x10018
-        ||!CopyChecked(&inputs,params.inputs,sizeof(inputs))||!params.info
+    if(!ownerScope||!DeviceMatches(device)||!CopyFast(&params,supplied,sizeof(params))||params.version!=0x10018
+        ||!CopyFast(&inputs,params.inputs,sizeof(inputs))||!params.info
         ||!ReadHairInput(ownerScope->owner,inputs,hair,error)) {
         RejectReason(error.empty()?"prebuild caller/device/layout not established":error);return -1;
     }
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info{};
-    if(!PrebuildTriangles(hair,inputs.flags,info)||!CopyChecked(params.info,&info,sizeof(info))) {
-        RejectReason("triangle prebuild capacity unavailable");return -1;
+    if(!PrebuildTriangles(hair,inputs.flags,info)||!CopyFast(params.info,&info,sizeof(info))) {
+        RejectReason("triangle prebuild refused (capacity, or conversions stopped: see the tracking lost line)");return -1;
     }
     ownerScope->havePrebuild=true;return 0;
 } catch(...) {StopConversions();return -1;
 }
 int32_t WINAPI Build(ID3D12GraphicsCommandList4* list,const BuildParams* supplied) try {
-    if(!active.load(std::memory_order_acquire)||!At(_ReturnAddress(),0x280f9a4))return originalBuild(list,supplied);
-    HookTimer timer;
-    if(!HairTracedNow()) {declinedWhileOff.fetch_add(1,std::memory_order_relaxed);return -1;}
+    if(!active.load(std::memory_order_acquire)||!At(_ReturnAddress(),Game().hairCalls[1].ret))return originalBuild(list,supplied);
+    HookTimer timer(buildTicks);buildCalls.fetch_add(1,std::memory_order_relaxed);
+    HookMarks marks(&OwnerScope::buildIn,&OwnerScope::buildOut);
+    HairTracedNow();
     BuildParams params{};ExtendedBuild desc{};HairInput hair;std::string error;
-    if(!ownerScope||list!=ownerScope->list||!CopyChecked(&params,supplied,sizeof(params))
-        ||params.version!=0x10020||params.postCount||params.post||!CopyChecked(&desc,params.desc,sizeof(desc))
+    if(!ownerScope||list!=ownerScope->list||!CopyFast(&params,supplied,sizeof(params))
+        ||params.version!=0x10020||params.postCount||params.post||!CopyFast(&desc,params.desc,sizeof(desc))
         ||!ReadHairInput(ownerScope->owner,desc.inputs,hair,error)) {
         RejectReason(error.empty()?"build owner/prebuild/layout not established":error);return -1;
     }
@@ -199,45 +434,58 @@ int32_t WINAPI Build(ID3D12GraphicsCommandList4* list,const BuildParams* supplie
 } catch(...) {StopConversions();return -1;
 }
 uintptr_t WINAPI Copy(void* destination,const void* source,size_t bytes) {
-    if(!active.load(std::memory_order_acquire)||!At(_ReturnAddress(),0x1f0b139))return originalCopy(destination,source,bytes);
+    if(!active.load(std::memory_order_acquire)||!At(_ReturnAddress(),Game().hairCalls[2].ret))return originalCopy(destination,source,bytes);
     if(!bytes)return originalCopy(destination,source,bytes);
     constexpr size_t stride=sizeof(D3D12_RAYTRACING_INSTANCE_DESC);
-    if(bytes%stride||bytes>1024ull*1024*stride||!Readable(source,bytes)) {
+    if(bytes%stride||bytes>1024ull*1024*stride) {
         StopConversions();RejectReason("hair instance copy bounds not established");return originalCopy(destination,source,bytes);
     }
-    try {
-        auto& state=S();std::lock_guard lock(state.instanceLock);
-        const bool traced=HairTracedNow()&&GetTickCount64()>=traceAfterTick.load(std::memory_order_relaxed);
-        // Allocated before publishing any game gate. Chunking bounds CPU storage
-        // even for a large scene and requires no allocation on the render path.
-        for(size_t at=0;at<bytes;) {
-            const size_t part=std::min(bytes-at,state.instanceWorkspace.size()*stride);
-            auto instances=std::span(state.instanceWorkspace.data(),part/stride);
-            {
-                HookTimer timer; // DOTS's own work only, not the game's copy.
-                if(!part||!CopyChecked(state.instanceWorkspace.data(),static_cast<const std::byte*>(source)+at,part)) {
-                    StopConversions();RejectReason("hair instance source changed during copy");
-                    return originalCopy(destination,source,bytes);
-                }
-                if(!PrepareInstances(instances,traced)) {
-                    StopConversions();for(auto& entry:instances)if(entry.InstanceMask&0x80)entry.InstanceMask=0;
-                }
-            }
-            originalCopy(static_cast<std::byte*>(destination)+at,instances.data(),part);at+=part;
+    // The game's copy runs unchanged and in parallel with its other copies;
+    // only hair entries are then rewritten in the destination (the GPU reads
+    // this upload memory only after the game submits).
+    const auto copied=originalCopy(destination,source,bytes);
+    {
+        HookTimer timer(copyTicks); // DOTS's own work only, not the game's copy.
+        copyCalls.fetch_add(1,std::memory_order_relaxed);instancesScanned.fetch_add(bytes/stride,std::memory_order_relaxed);
+        copyThread.store(GetCurrentThreadId(),std::memory_order_relaxed);
+        if(const int64_t previous=lastCopyQpc.exchange(timer.start.QuadPart,std::memory_order_relaxed)) {
+            const int64_t gap=timer.start.QuadPart-previous;int64_t longest=copyGapMax.load(std::memory_order_relaxed);
+            while(gap>longest&&!copyGapMax.compare_exchange_weak(longest,gap,std::memory_order_relaxed)) {}
         }
-        // This verified caller ignores memcpy's return; preserve its usual value.
-        return reinterpret_cast<uintptr_t>(destination);
-    } catch(...) {StopConversions();RejectReason("hair instance copy failed");return originalCopy(destination,source,bytes);}
+        const bool traced=HairTracedNow()&&GetTickCount64()>=traceAfterTick.load(std::memory_order_relaxed);
+        if(!PatchInstanceCopy(static_cast<D3D12_RAYTRACING_INSTANCE_DESC*>(destination),
+            static_cast<const D3D12_RAYTRACING_INSTANCE_DESC*>(source),bytes/stride,traced).ok) {
+            StopConversions();RejectReason("hair instance copy failed");
+        }
+    }
+    LogCost();LogDiagnostics();
+    return copied;
 }
-bool VerifyProfile(std::string& error) {
+// Identifies the running build by its exact executable size and SHA-256, then
+// validates every profiled site in the loaded image.
+bool VerifyProfile(const void* deviceCaller,std::string& error) {
     auto& state=S();
     std::ifstream file(std::filesystem::path(state.executable),std::ios::binary|std::ios::ate);
-    if(!file||file.tellg()!=90832336) {error="unsupported game executable size";return false;}
-    std::vector<std::byte> data(90832336);file.seekg(0);
-    if(!file.read(reinterpret_cast<char*>(data.data()),static_cast<std::streamsize>(data.size()))||!HashEquals(data,kGameHash)) {
-        error="unsupported game executable SHA-256";return false;
+    const auto size=file?static_cast<int64_t>(file.tellg()):-1;
+    const profile::GameProfile* selected=nullptr;std::vector<std::byte> data;
+    for(const auto& game:profile::kProfiles) {
+        if(size!=static_cast<int64_t>(game.exeSize))continue;
+        if(data.empty()) {
+            data.resize(game.exeSize);file.seekg(0);
+            if(!file.read(reinterpret_cast<char*>(data.data()),static_cast<std::streamsize>(data.size()))) {error="game executable unreadable";return false;}
+        }
+        if(HashEquals(data,game.exeHash)) {selected=&game;break;}
     }
-    return profile::ValidateMapped(state.game,error);
+    if(!selected) {
+        char text[96]{};_snprintf_s(text,_TRUNCATE,"unsupported game build (executable %lld bytes)",static_cast<long long>(size));
+        error=text;return false;
+    }
+    // The device was created from this build's own renderer call site.
+    if(!At(deviceCaller,selected->deviceReturns[0])&&!At(deviceCaller,selected->deviceReturns[1])) {error="renderer device caller does not belong to this build";return false;}
+    if(!profile::ValidateMapped(state.game,*selected,error))return false;
+    SetHairOwnerLayout(selected->owner.scratch,selected->owner.blas,selected->owner.positions,selected->owner.indices);
+    gameProfile.store(selected,std::memory_order_release);
+    return true;
 }
 bool VerifyDetour(void* target,void* hook) {
     uint8_t code[5]{},relay[14]{};int32_t displacement{};
@@ -256,7 +504,7 @@ bool InstallGameHooks(std::string& error) {
     const std::array<void*,4> hooks{reinterpret_cast<void*>(&Builder),reinterpret_cast<void*>(&Prebuild),reinterpret_cast<void*>(&Build),reinterpret_cast<void*>(&Copy)};
     auto& targets=gameTargets;auto& enabled=gameEnabled;std::array<void*,4> originals{};
     for(size_t i=0;i<targets.size();++i) {
-        targets[i]=const_cast<std::byte*>(base+profile::kEntries[i].rva);
+        targets[i]=const_cast<std::byte*>(base+Game().entries[i].rva);
         if(MH_CreateHook(targets[i],hooks[i],&originals[i])!=MH_OK) {error="game hook conflict or unsupported relocation";return false;}
     }
     originalBuilder=reinterpret_cast<BuilderFn>(originals[0]);originalPrebuild=reinterpret_cast<PrebuildFn>(originals[1]);
@@ -278,7 +526,7 @@ void AbortPreparation() noexcept {
     if(!AbortGpuPreparation())single_module::Log(L"WITCHER_DOTS preparation rollback indeterminate; forwarding bindings retained");
 }
 bool PublishGates(std::string& error) {
-    return profile::PublishGates(reinterpret_cast<uintptr_t>(S().game),profile::kGates,error);
+    return profile::PublishGates(reinterpret_cast<uintptr_t>(S().game),Game().gates,error);
 }
 // RTX 40 series is Ada: CUDA compute capability 8.9 (desktop, laptop and
 // workstation parts). The CUDA device must match the game's D3D12 adapter LUID
@@ -323,7 +571,7 @@ void BeforeDeviceCreate(const void* caller) noexcept {
         {
             std::lock_guard lock(state.lock);Preferences();
             if(!state.snapshot.applicable||!state.snapshot.requested||!state.snapshot.crashReportRequested||state.dredEnabled
-                ||state.attempted||single_overlay::native::InsideLoader()||(!At(caller,0x1ec4889)&&!At(caller,0x1ec48c2)))return;
+                ||state.attempted||single_overlay::native::InsideLoader()||!profile::KnownDeviceCaller(caller,state.game))return;
             state.dredEnabled=true;
         }
         // DRED applies only to devices created after it is configured.
@@ -338,6 +586,8 @@ void BeforeDeviceCreate(const void* caller) noexcept {
         dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
         dred->SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
         single_module::Log(L"WITCHER_DOTS crash report requested: DRED breadcrumbs, contexts and page faults enabled");
+        if(EnableDispatchDiagnostics())
+            single_module::Log(L"WITCHER_DOTS crash report: dispatches logged (pipeline, thread groups, issuing code)");
     } catch(...) {}
 }
 void ObserveDevice(IUnknown* object,const void* caller) noexcept {
@@ -346,11 +596,11 @@ void ObserveDevice(IUnknown* object,const void* caller) noexcept {
       {
         std::lock_guard lock(state.lock);Preferences();
         if(!state.snapshot.applicable||!state.snapshot.requested||state.attempted||single_overlay::native::InsideLoader()
-            ||(!At(caller,0x1ec4889)&&!At(caller,0x1ec48c2)))return;
+            ||!profile::KnownDeviceCaller(caller,state.game))return;
         state.attempted=true;state.snapshot.stage=Stage::Preparing;
       }
         std::string error;
-        if(!VerifyProfile(error)) {Reason(Stage::UnsupportedGame,error);return;}
+        if(!VerifyProfile(caller,error)) {Reason(Stage::UnsupportedGame,error);return;}
         settingKnown.store(true,std::memory_order_release);
         if(!ResolveNativeDevice(object,state.device)||FAILED(state.device.As(&state.identity))) {
             Reason(Stage::Failed,"native D3D12 device ownership unavailable");return;
@@ -376,7 +626,7 @@ void ObserveDevice(IUnknown* object,const void* caller) noexcept {
         }
         using CapsFn=int32_t(WINAPI*)(ID3D12Device*,uint32_t,void*,uint32_t);
         uint32_t lss{};
-        const auto caps=reinterpret_cast<CapsFn>(reinterpret_cast<std::byte*>(state.game)+0x7cd40);
+        const auto caps=reinterpret_cast<CapsFn>(reinterpret_cast<std::byte*>(state.game)+Game().entries[4].rva);
         int32_t capsStatus=caps(state.device.Get(),6,&lss,sizeof(lss));
         if(capsStatus==-4) { // NVAPI_API_NOT_INITIALIZED on an early loader route.
             using QueryFn=void*(__cdecl*)(uint32_t);using InitializeFn=int32_t(__cdecl*)();
@@ -413,17 +663,16 @@ void ObserveDevice(IUnknown* object,const void* caller) noexcept {
             _snprintf_s(text,_TRUNCATE,"requires NVIDIA driver 617.14 or later (found %u.%02u)",driver/100,driver%100);
             Reason(Stage::UnsupportedDriver,text);return;
         }
-        if(!state.shaders.Prepare(state.game,state.directory,error)) {Reason(Stage::Failed,error);return;}
+        if(!state.shaders.Prepare(state.game,Game().shaders,state.directory,error)) {Reason(Stage::Failed,error);return;}
         {std::lock_guard lock(state.lock);state.snapshot.shaderReady=true;}
-        state.instanceWorkspace.resize(4096);
         if(!InitializeGpu(state.device.Get(),&state.shaders,error)||!InstallGameHooks(error)) {AbortPreparation();Reason(Stage::Failed,error);return;}
         // All shader translations, hooks, converter state and budgets are ready
         // before the first game gate is published. The logical getter is last.
         active.store(true,std::memory_order_release);
         if(!PublishGates(error)) {AbortPreparation();Reason(Stage::Failed,error);return;}
         wchar_t line[512]{};
-        swprintf_s(line,L"WITCHER_DOTS prepared pid=%lu gameSHA256=%S gpu=%s vendor=%04x device=%04x capability=%d.%d luid=%08x:%08x driver=%u nativeLSS=0 fourTrianglesPerSegment=1 geometryBudgetMiB=512",
-            GetCurrentProcessId(),kGameHash,adapter.Description,adapter.VendorId,adapter.DeviceId,major,minor,
+        swprintf_s(line,L"WITCHER_DOTS prepared pid=%lu game=%S gameSHA256=%S gpu=%s vendor=%04x device=%04x capability=%d.%d luid=%08x:%08x driver=%u nativeLSS=0 fourTrianglesPerSegment=1 geometryBudgetMiB=512",
+            GetCurrentProcessId(),Game().label,Game().exeHash,adapter.Description,adapter.VendorId,adapter.DeviceId,major,minor,
             static_cast<uint32_t>(state.device->GetAdapterLuid().HighPart),state.device->GetAdapterLuid().LowPart,driver);
         single_module::Log(line);
         single_module::Log(L"WITCHER_DOTS stage=prepared; waiting for game hair (game Path Traced Hair setting)");
@@ -444,12 +693,10 @@ Snapshot ReadSnapshot() noexcept {
         out.evictions=stats.evictions;out.liveOwners=stats.liveOwners;out.hairInstances=stats.hairInstances;
         out.poolAllocations=stats.poolAllocations;out.poolReleases=stats.poolReleases;out.poolReturns=stats.reclaims;out.fullRebuilds=stats.fullRebuilds;
         out.hairBlasBytes=stats.hairBlasBytes;out.hairScratchBytes=stats.hairScratchBytes;
-        out.declinedWhileOff=declinedWhileOff.load(std::memory_order_relaxed);
-        LARGE_INTEGER frequency{};
-        if(QueryPerformanceFrequency(&frequency)&&frequency.QuadPart>0) {
-            const uint64_t ticks=hookTicks.load(std::memory_order_relaxed),hz=static_cast<uint64_t>(frequency.QuadPart);
-            out.hookMicroseconds=ticks/hz*1000000+ticks%hz*1000000/hz;
-        }
+        out.buildMicroseconds=Microseconds(buildTicks.load(std::memory_order_relaxed));
+        out.buildLockWaitMicroseconds=Microseconds(stats.buildLockWaitTicks);out.buildLockHeldMicroseconds=Microseconds(stats.buildLockHeldTicks);
+        out.copyMicroseconds=Microseconds(copyTicks.load(std::memory_order_relaxed));
+        out.copyCalls=copyCalls.load(std::memory_order_relaxed);out.instancesScanned=instancesScanned.load(std::memory_order_relaxed);
         out.gameHairTraced=out.stage==Stage::Active&&GameHairTraced();
         {
             auto& state=S();std::lock_guard lock(state.lock);

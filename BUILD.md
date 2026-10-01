@@ -1,7 +1,8 @@
-# Building v1.4
+# Building v1.4.1
 
-The v1.4 release uses the v1.4.0-dev.30 runtime source, with release version
-metadata updated to v1.4.0 (file version 1.4.0.30).
+The v1.4.1 release uses the v1.4-dev runtime source through dev.43, with release
+version metadata updated to v1.4.1 (file version 1.4.1.43). The newer RTX 30
+development work is excluded from this release.
 
 The release target is `RTXMFGUnified`, producing `Release/RTXMFG.dll`.
 Use Windows x64, Visual Studio 2022/MSVC 14.38.33130, Windows SDK
@@ -40,7 +41,7 @@ actual paths and a fresh build directory:
     -StreamlineRoot 'C:/SDKs/streamline-sdk-v2.14.1' `
     -ImGuiRoot 'C:/SDKs/reshade-6.8.0/deps/imgui' `
     -NativeCacheRoot 'C:/BuildInputs/rtxmfg-sm86' `
-    -BuildDirectory "$PWD/build/v1.4.0" `
+    -BuildDirectory "$PWD/build/v1.4.1" `
     -EnableNgxCreateResultDiagnostics
 ```
 

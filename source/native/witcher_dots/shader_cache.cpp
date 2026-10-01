@@ -88,9 +88,10 @@ bool ShaderCache::Validate(IDxcBlob* blob,std::vector<std::byte>& output,std::st
 }
 bool ShaderCache::Translate(std::span<const std::byte> source,ShaderKind kind,std::vector<std::byte>& output,std::string& error) {
     output.clear();
-    if(!HashEquals(source,kind==ShaderKind::ClosestHit?kClosestHash:kPrepassHash)) {error="unknown hair shader";return false;}
+    const auto* shader=FindShader(source,kind);
+    if(!shader) {error="unknown hair shader";return false;}
     std::string original,ir;
-    if(!Disassemble(source,original,error)||!TranslateIr(original,kind,ir,error))return false;
+    if(!Disassemble(source,original,error)||!TranslateIr(original,*shader,ir,error))return false;
     ComPtr<IDxcBlobEncoding> input;ComPtr<IDxcOperationResult> result;ComPtr<IDxcBlob> blob,optimized;
     ComPtr<IDxcBlobEncoding> messages;
     // Assembling IR alone validates but does not finalize a library. The
@@ -131,21 +132,26 @@ bool ShaderCache::CompileProgram(std::string_view source,const wchar_t* target,s
     if(FAILED(compiler_->Compile(&input,args,_countof(args),nullptr,IID_PPV_ARGS(&result)))||!Result(result.Get(),blob,error))return false;
     return Validate(blob.Get(),output,error);
 }
-bool ShaderCache::Prepare(HMODULE game,const std::wstring& directory,std::string& error) {
+bool ShaderCache::Prepare(HMODULE game,const std::array<uint32_t,4>& rvas,const std::wstring& directory,std::string& error) {
     if(!game) {error="no game image";return false;}
     if(!Initialize(directory,error)||!CompileConverter(converter_,error))return false;
-    constexpr std::array<uint32_t,4> rvas{0x33bbc78,0x3570888,0x326ebd8,0x34237e8};
-    constexpr std::array<uint32_t,4> sizes{8240,8240,63072,63072};
+    // Each embedded copy must be one known shader of its kind (exact size and
+    // SHA-256); both copies of a kind must be the same shader.
     for(size_t i=0;i<rvas.size();++i) {
+        const auto kind=i<2?ShaderKind::ClosestHit:ShaderKind::Prepass;
         const auto* p=reinterpret_cast<const std::byte*>(game)+rvas[i];
-        if(!Readable(p,sizes[i])) {error="unreadable game shader";return false;}
-        std::vector<std::byte> source(sizes[i]);
-        if(!CopyChecked(source.data(),p,source.size())||!HashEquals(source,i<2?kClosestHash:kPrepassHash)) {
-            error="live hair shader identity mismatch";return false;
+        const ShaderIdentity* identity=nullptr;std::vector<std::byte> source;
+        for(const auto& known:KnownShaders()) {
+            if(known.kind!=kind||!Readable(p,known.size))continue;
+            source.resize(known.size);
+            if(CopyChecked(source.data(),p,source.size())&&HashEquals(source,known.sha256)) {identity=&known;break;}
         }
-        originals_[i]=p;
-        if(i==0&&!Translate(source,ShaderKind::ClosestHit,closest_,error))return false;
-        if(i==2&&!Translate(source,ShaderKind::Prepass,prepass_,error))return false;
+        auto& selected=kind==ShaderKind::ClosestHit?closestIdentity_:prepassIdentity_;
+        if(i%2==0)selected=nullptr;
+        if(!identity||(i%2==1&&identity!=selected)) {error="live hair shader identity mismatch";return false;}
+        selected=identity;originals_[i]=p;
+        if(i==0&&!Translate(source,kind,closest_,error))return false;
+        if(i==2&&!Translate(source,kind,prepass_,error))return false;
     }
     return Ready();
 }
@@ -153,10 +159,11 @@ std::span<const std::byte> ShaderCache::Replacement(const void* data,size_t size
     // Some engines copy embedded DXIL before creating the state object. Size is
     // only a cheap filter; exact live content establishes the shader identity.
     try {
-        if(!Ready()||(size!=8240&&size!=63072)||!Readable(data,size))return {};
+        if(!Ready()||!closestIdentity_||!prepassIdentity_||(size!=closestIdentity_->size&&size!=prepassIdentity_->size)||!Readable(data,size))return {};
+        const auto* identity=size==closestIdentity_->size?closestIdentity_:prepassIdentity_;
         std::vector<std::byte> copy(size);
-        if(!CopyChecked(copy.data(),data,size)||!HashEquals(copy,size==8240?kClosestHash:kPrepassHash))return {};
-        return size==8240?std::span<const std::byte>(closest_):std::span<const std::byte>(prepass_);
+        if(!CopyChecked(copy.data(),data,size)||!HashEquals(copy,identity->sha256))return {};
+        return identity==closestIdentity_?std::span<const std::byte>(closest_):std::span<const std::byte>(prepass_);
     } catch(...) {}
     return {};
 }
