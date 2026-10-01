@@ -7,7 +7,9 @@
 #include "overlay_native.h"
 #include "overlay_application_imports.h"
 #include "overlay_adapter_parent.h"
+#include "witcher_dots/witcher_dots.h"
 #include <d3d12.h>
+#include <intrin.h>
 #include <atomic>
 #include <array>
 #include <cstring>
@@ -65,7 +67,13 @@ struct DeviceGateways {
     inline static std::array<std::atomic<DeviceFn>,8> originals{};
     template<size_t I> static HRESULT WINAPI Create(IUnknown* adapter,D3D_FEATURE_LEVEL level,REFIID iid,void** output) {
         adapter_parent::Observe(adapter);
-        return originals[I].load(std::memory_order_acquire)(adapter,level,iid,output);
+        if(output)witcher_dots::BeforeDeviceCreate(_ReturnAddress());
+        const auto result=originals[I].load(std::memory_order_acquire)(adapter,level,iid,output);
+        const DWORD error=GetLastError();
+        if(SUCCEEDED(result)&&output&&*output)
+            witcher_dots::ObserveDevice(static_cast<IUnknown*>(*output),_ReturnAddress());
+        SetLastError(error);
+        return result;
     }
     template<size_t... I> static auto Entries(std::index_sequence<I...>) {
         return std::array<DeviceFn,sizeof...(I)>{&Create<I>...};
@@ -113,6 +121,14 @@ bool Eligible(HMODULE module,FARPROC original) noexcept {
         if (!GetSystemDirectoryW(system,MAX_PATH)||wcscat_s(system,L"\\d3d12.dll")) return false;
         eligible=!_wcsicmp(path,system)
             && GetProcAddress(module,"D3D12CreateDevice")==original;
+        if (!eligible && witcher_dots::GameProcess()) {
+            // Witcher DOTS must observe the renderer's device even through a
+            // local ReShade d3d12.dll (same public ABI); it resolves the native
+            // device behind the returned wrapper itself.
+            eligible=GetProcAddress(module,"D3D12CreateDevice")==original;
+            for (const char* name:{"ReShadeRegisterAddon","ReShadeUnregisterAddon"})
+                eligible=slots::ImageEntry(module,reinterpret_cast<void*>(GetProcAddress(module,name)))&&eligible;
+        }
     } else if (!_wcsicmp(leaf,L"sl.interposer.dll")) {
         // Establish the expected public interposer export family in this exact
         // loaded image. Never bind a shared/private Streamline COM method.
@@ -148,6 +164,18 @@ FARPROC ResolveProc(HMODULE module,LPCSTR name,FARPROC original) noexcept {
 #endif
 #endif
 }
+bool OwnsInterface(void* object) noexcept {
+    return object&&!gInsideOverlay&&proxy::Owned(static_cast<IUnknown*>(object));
+}
+bool WrapUpgradedInterface(void** output) noexcept {
+    if (gInsideOverlay||!single_module::OwnsBackend()) return false;
+#if MFG_UNLOCK_DIAGNOSTIC_NO_SINGLE_OVERLAY
+    (void)output;
+    return false;
+#else
+    return proxy::WrapUpgraded(output);
+#endif
+}
 void ArmFactoryGateway() noexcept {
     static std::atomic_flag publishing=ATOMIC_FLAG_INIT;
     if(publishing.test_and_set(std::memory_order_acquire))return;
@@ -155,9 +183,11 @@ void ArmFactoryGateway() noexcept {
     HMODULE executable=GetModuleHandleW(nullptr);
     slots::Batch batch;
     const bool loaderCallout=native::InsideLoader();
+    const bool dotsDevice=witcher_dots::GameProcess();
     size_t deferred=0;
     const bool inspected=slots::VisitImports(executable,[&](const char* name,void** slot) {
         if (strcmp(name,"CreateDXGIFactory")&&strcmp(name,"CreateDXGIFactory1")&&strcmp(name,"CreateDXGIFactory2")
+            && !(dotsDevice&&!strcmp(name,"D3D12CreateDevice"))
             && !(name[0]=='v'&&name[1]=='k')) return true;
         void* value=protected_pointer::ReadPointer(reinterpret_cast<uintptr_t>(slot));
         HMODULE owner=nullptr;
@@ -166,6 +196,12 @@ void ArmFactoryGateway() noexcept {
         const auto original=reinterpret_cast<FARPROC>(value);
         const auto replacement=ResolveProc(owner,name,original);
         if (original==replacement) return true;
+        if(!strcmp(name,"D3D12CreateDevice")) {
+            // DOTS requires this early, aligned import. Do not use the
+            // factory-entry fallback for a different public ABI.
+            if(!slots::ImageSlot(executable,slot)) {++deferred;return true;}
+            return batch.Add(executable,slot,value,reinterpret_cast<void*>(replacement));
+        }
         // DllMain retains only aligned data publication. Public-entry fallback
         // is retried synchronously at slInit, before application graphics calls.
         if (loaderCallout && !slots::ImageSlot(executable,slot)) { ++deferred; return true; }
