@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+struct IDXGIAdapter3;
 namespace witcher_dots {
 // ABI declarations for the one verified game/NVAPI profile. This translation
 // layer implements only array-layout, one opaque LSS geometry, implicit +1
@@ -41,6 +42,7 @@ struct RuntimeStats {
     uint64_t lastBuildTick{}, lastHairTick{}; // GetTickCount64 of the latest conversion / admitted hair instance
     uint64_t evictions{};
     uint64_t poolAllocations{}, poolReleases{}, fullRebuilds{}, reclaims{};
+    uint64_t poolGrowths{}; // converted-vertex buffers allocated past the pool budget (loads)
     uint64_t hairBlasBytes{}, hairScratchBytes{}; // the game's AS/scratch buffers of live converted hair
     uint64_t buildLockWaitTicks{}, buildLockHeldTicks{}; // QPC ticks: waiting for / holding the runtime lock in hair builds
     uint64_t releasedLists{}, releasedRoots{}; // destroyed by the game, then released from tracking
@@ -71,6 +73,12 @@ void StopConversions() noexcept;
 // Offsets of the build's hair owner fields (scratch, BLAS, LSS positions,
 // LSS indices); set once, before any hair hook is active.
 void SetHairOwnerLayout(uint32_t scratch,uint32_t blas,uint32_t positions,uint32_t indices) noexcept;
+// The prepared device's adapter: its OS video-memory budget decides whether the
+// converted-vertex pool may grow past kGeometryBudget. Without it the budget is
+// a hard limit.
+void SetMemoryAdapter(IDXGIAdapter3* adapter) noexcept;
+// Harness only: smaller pool limits, so pool pressure can be exercised.
+void SetGeometryPoolLimits(uint64_t budget,uint64_t ceiling,uint64_t reserve) noexcept;
 bool ReadHairInput(void* owner,const ExtendedInputs& inputs,HairInput& out,std::string& error);
 bool PrebuildTriangles(const HairInput& hair,uint32_t flags,D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO& info);
 bool BuildTriangles(HairInput hair,ID3D12GraphicsCommandList4* list,const ExtendedBuild& desc,std::string& error);

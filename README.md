@@ -1,4 +1,4 @@
-# Universal RTXMFG Unlocker — v1.4.1
+# Universal RTXMFG Unlocker — v1.4.1-hotfix.1
 
 DLSS Multi Frame Generation controls for Windows x64 games on RTX 40 series GPUs,
 with experimental RTX 30 support. The backend and menu are combined in one
@@ -13,6 +13,14 @@ MFG override maximum. A listed maximum does not guarantee that the active
 Frame Generation pipeline can apply it.
 
 If this mod helps you, [help me get through university on Ko-fi](https://ko-fi.com/dashdogy).
+
+## Changes in v1.4.1-hotfix.1
+
+- **Fixes path-traced HairWorks compatibility with ReShade and RenoDX in
+  The Witcher 3.**
+- Fixes cases of hair disappearing after loading a save or moving to another area.
+- Keeps hair diagnostics available throughout longer sessions, improving logs
+  for bug reports.
 
 ## Changes in v1.4.1
 
@@ -42,12 +50,12 @@ If this mod helps you, [help me get through university on Ko-fi](https://ko-fi.c
 
 ## Install
 
-The v1.4.1 download contains **`RTXMFG.dll`**. The menu is built in; no separate
+The v1.4.1-hotfix.1 download contains **`RTXMFG.dll`**. The menu is built in; no separate
 ReShade or external loader installation is needed.
 
 1. Close the game. If upgrading from a split release, remove the old mod
    components as described below first.
-2. Download `RTXMFG-v1.4.1.zip` from [Releases](https://github.com/dashdogy/RTX40MFG-Unlock/releases)
+2. Download `RTXMFG-v1.4.1-hotfix.1.zip` from [Releases](https://github.com/dashdogy/RTX40MFG-Unlock/releases)
    and extract it.
 3. Rename `RTXMFG.dll` to **one** supported filename below that the game loads
    early. Place it beside the **actual game executable**, not the launcher.

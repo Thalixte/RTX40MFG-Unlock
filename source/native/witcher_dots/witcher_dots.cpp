@@ -621,6 +621,7 @@ void ObserveDevice(IUnknown* object,const void* caller) noexcept {
         DXGI_ADAPTER_DESC1 adapter{};ComPtr<IDXGIAdapter3> memoryAdapter;
         if(!Adapter(state.device.Get(),adapter,memoryAdapter)) {Reason(Stage::Failed,"authoritative DXGI adapter lookup failed");return;}
         {std::lock_guard lock(state.lock);state.memoryAdapter=memoryAdapter;}
+        SetMemoryAdapter(memoryAdapter.Get());
         {
             std::lock_guard lock(state.lock);state.snapshot.deviceId=adapter.DeviceId;state.snapshot.luid=state.device->GetAdapterLuid();
         }

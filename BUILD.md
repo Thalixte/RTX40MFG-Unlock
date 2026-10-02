@@ -1,8 +1,9 @@
-# Building v1.4.1
+# Building v1.4.1-hotfix.1
 
-The v1.4.1 release uses the v1.4-dev runtime source through dev.43, with release
-version metadata updated to v1.4.1 (file version 1.4.1.43). The newer RTX 30
-development work is excluded from this release.
+The v1.4.1-hotfix.1 release uses the V1.4.1 runtime with the merged dev.45
+ReShade/RenoDX hair, save-load hair, and session logging fixes. ProductVersion
+is 1.4.1-hotfix.1 and FileVersion is 1.4.1.45. The newer RTX 30 development
+work is excluded from this release.
 
 The release target is `RTXMFGUnified`, producing `Release/RTXMFG.dll`.
 Use Windows x64, Visual Studio 2022/MSVC 14.38.33130, Windows SDK
@@ -41,7 +42,7 @@ actual paths and a fresh build directory:
     -StreamlineRoot 'C:/SDKs/streamline-sdk-v2.14.1' `
     -ImGuiRoot 'C:/SDKs/reshade-6.8.0/deps/imgui' `
     -NativeCacheRoot 'C:/BuildInputs/rtxmfg-sm86' `
-    -BuildDirectory "$PWD/build/v1.4.1" `
+    -BuildDirectory "$PWD/build/v1.4.1-hotfix.1" `
     -EnableNgxCreateResultDiagnostics
 ```
 

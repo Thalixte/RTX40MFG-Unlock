@@ -10,6 +10,13 @@ constexpr uint32_t kTrianglesPerSegment = 4;
 constexpr uint32_t kVerticesPerSegment = 12;
 constexpr uint64_t kBytesPerSegment = 144;
 constexpr uint64_t kGeometryBudget = 512ull * 1024 * 1024;
+// The converted-vertex pool holds kGeometryBudget in steady play. A save load
+// or area change keeps the old area's recordings in flight while the new hair
+// is built: the pool may then grow to kGeometryCeiling, only while the OS
+// video-memory budget keeps kVramReserve free (the game does not retry a hair
+// build that was refused, so that hair would stay missing until recreated).
+constexpr uint64_t kGeometryCeiling = 2048ull * 1024 * 1024;
+constexpr uint64_t kVramReserve = 1024ull * 1024 * 1024;
 constexpr uint32_t kMaxSegments = 65535u * 64u;
 struct Plan {
     uint32_t segments{}, vertices{}, groups{};

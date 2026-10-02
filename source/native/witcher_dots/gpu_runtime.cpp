@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <vector>
 #include <psapi.h>
+#include <dxgi1_4.h>
 #if WITCHER_DOTS_HARNESS
 #define DOTS_TRACE(...) std::printf(__VA_ARGS__)
 #else
@@ -553,6 +554,14 @@ struct Context {
     std::mutex lock;
     ComPtr<ID3D12Device5> device;
     ComPtr<IUnknown> identity;
+    // Successful device-proxy proofs are immutable and retain both identities.
+    // The key is published last, preventing pointer reuse or partial reads.
+    struct DeviceAlias {
+        ComPtr<IUnknown> proxy,native;
+        std::atomic<IUnknown*> key{};
+    };
+    std::array<DeviceAlias,8> deviceAliases{};
+    std::mutex deviceAliasLock;
     ComPtr<ID3D12RootSignature> converterRoot;
     ComPtr<ID3D12PipelineState> converterPso;
     std::atomic<ShaderCache*> shaders{};
@@ -563,6 +572,9 @@ struct Context {
     std::array<Association,kMaxOwners> associations{};
     RuntimeStats stats{};
     uint64_t lastSweep{},lastRebuild{},lastListSweep{};
+    // Converted-vertex pool limits (BuildTriangles); only the harness lowers them.
+    uint64_t poolBudget{kGeometryBudget},poolCeiling{kGeometryCeiling},vramReserve{kVramReserve};
+    ComPtr<IDXGIAdapter3> memory; // The prepared device's adapter (OS video-memory budget).
 };
 Context& C() { static auto* const value=new Context;return *value; }
 // Hair-build cost split for the overlay: waiting for the runtime lock versus
@@ -588,7 +600,32 @@ std::atomic<bool> removalReportArmed{};
 std::atomic<uint64_t> settingChangeTick{};std::atomic<bool> settingChangeOn{};
 bool OwnedDevice(ID3D12Device* device) {
     if(!device)return false;ComPtr<IUnknown> id;
-    return SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&id)))&&id.Get()==C().identity.Get();
+    if(FAILED(device->QueryInterface(IID_PPV_ARGS(&id)))||!id)return false;
+    auto& ctx=C();
+    if(id.Get()==ctx.identity.Get())return true;
+    const auto known=[&] {
+        for(const auto& alias:ctx.deviceAliases)
+            if(alias.key.load(std::memory_order_acquire)==id.Get()&&alias.native.Get()==ctx.identity.Get())return true;
+        return false;
+    };
+    if(known())return true;
+    // ReShade leaves resources native but hooks GetDevice to return its proxy.
+    // Compare the proven native COM identity, never just the adapter/LUID.
+    // Resolution is outside the alias lock: wrapper calls can take their own
+    // locks, and the fallback creates a native fence on older wrappers.
+    ComPtr<ID3D12Device5> native;ComPtr<IUnknown> nativeId;
+    if(!ResolveNativeDevice(device,native)||FAILED(native.As(&nativeId))
+        ||!nativeId||nativeId.Get()!=ctx.identity.Get())return false;
+    // Retain once rather than repeating unwrap/fence discovery per hair update.
+    // No COM calls under this lock; empty entries receive already-retained refs.
+    std::lock_guard lock(ctx.deviceAliasLock);
+    if(known())return true;
+    for(auto& alias:ctx.deviceAliases)if(!alias.key.load(std::memory_order_relaxed)) {
+        auto* key=id.Get();alias.proxy=std::move(id);alias.native=std::move(nativeId);
+        alias.key.store(key,std::memory_order_release);break;
+    }
+    // A full cache changes only cost: this call still proved exact ownership.
+    return true;
 }
 template<class T> bool Child(T* child) {
     ComPtr<ID3D12Device> device;
@@ -852,6 +889,22 @@ bool Available(const Lease& lease) {
     const uint64_t complete=q==C().queues.end()?UINT64_MAX:q->second.fence->GetCompletedValue();
     return q!=C().queues.end()&&complete!=UINT64_MAX&&complete>=lease.fenceValue;
 }
+// Caller holds C().lock. Local video memory the pool may still take: the OS
+// budget less current use and the reserve; 0 when unknown.
+uint64_t VramHeadroom() {
+    auto& ctx=C();DXGI_QUERY_VIDEO_MEMORY_INFO local{};
+    if(!ctx.memory||FAILED(ctx.memory->QueryVideoMemoryInfo(0,DXGI_MEMORY_SEGMENT_GROUP_LOCAL,&local)))return 0;
+    const uint64_t used=local.CurrentUsage+ctx.vramReserve;
+    return local.Budget>used?local.Budget-used:0;
+}
+// Caller holds C().lock. Converted-vertex buffers held, and those in flight.
+struct PoolCount { uint32_t buffers{},busy{}; };
+PoolCount PoolUse() {
+    PoolCount count;
+    for(const auto& lease:C().leases)if(lease.vertices) {++count.buffers;if(!Available(lease))++count.busy;}
+    return count;
+}
+std::atomic<uint32_t> poolGrowthLogs{};
 // The game allocates every hair BLAS itself from the triangle prebuild sizes;
 // this bound only stops runaway accounting. A save load briefly holds the old
 // and the new hair together (about 2x the live set), which must not refuse
@@ -1548,6 +1601,15 @@ struct OwnerLayout { uint32_t scratch{0x4e0},blas{0x4e8},positions{0x4f8},indice
 void SetHairOwnerLayout(uint32_t scratch,uint32_t blas,uint32_t positions,uint32_t indices) noexcept {
     ownerLayout={scratch,blas,positions,indices};
 }
+void SetMemoryAdapter(IDXGIAdapter3* adapter) noexcept {
+    try {std::lock_guard lock(C().lock);C().memory=adapter;} catch(...) {}
+}
+void SetGeometryPoolLimits(uint64_t budget,uint64_t ceiling,uint64_t reserve) noexcept {
+    try {
+        std::lock_guard lock(C().lock);auto& ctx=C();
+        ctx.poolBudget=budget;ctx.poolCeiling=ceiling;ctx.vramReserve=reserve;
+    } catch(...) {}
+}
 bool ReadHairInput(void* owner,const ExtendedInputs& inputs,HairInput& out,std::string& error) {
     if(!owner||inputs.type!=1||inputs.count!=1||inputs.layout!=0||inputs.stride!=168
         ||(inputs.flags!=7&&inputs.flags!=0x27)||!CopyFast(&out.geometry,inputs.geometry,sizeof(out.geometry))) {error="unknown LSS descriptor";return false;}
@@ -1684,15 +1746,19 @@ bool BuildTriangles(HairInput hair,ID3D12GraphicsCommandList4* supplied,const Ex
     };
     if(chosen==kMaxLeases)chosen=bestFit(preferred);
     if(chosen==kMaxLeases&&preferred>hair.plan.bytes)chosen=bestFit(hair.plan.bytes);
-    const auto allocate=[&](Lease& candidate,uint64_t bytes) {
-        if(bytes>kGeometryBudget-ctx.stats.geometryBytes
+    const auto allocate=[&](Lease& candidate,uint64_t bytes,uint64_t limit) {
+        if(ctx.stats.geometryBytes+bytes>limit
             ||!Buffer(ctx.device.Get(),bytes,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,candidate.vertices))return false;
         candidate.vertices->SetName(L"WitcherDOTS converted hair vertices");
         candidate.capacity=bytes;ctx.stats.geometryBytes+=bytes;++ctx.stats.poolAllocations;return true;
     };
-    if(chosen==kMaxLeases)for(size_t i=0;i<ctx.leases.size();++i)if(Available(ctx.leases[i])&&!ctx.leases[i].vertices) {
-        if(allocate(ctx.leases[i],preferred)||(preferred>hair.plan.bytes&&allocate(ctx.leases[i],hair.plan.bytes)))chosen=i;
-        break;
+    const auto empty=[&] {
+        for(size_t i=0;i<ctx.leases.size();++i)if(Available(ctx.leases[i])&&!ctx.leases[i].vertices)return i;
+        return kMaxLeases;
+    };
+    if(chosen==kMaxLeases)if(const size_t i=empty();i!=kMaxLeases) {
+        if(allocate(ctx.leases[i],preferred,ctx.poolBudget)
+            ||(preferred>hair.plan.bytes&&allocate(ctx.leases[i],hair.plan.bytes,ctx.poolBudget)))chosen=i;
     }
     // Budget full of buffers sized for earlier hair: retire idle, undersized
     // ones (never in flight) until the new buffer fits.
@@ -1700,11 +1766,28 @@ bool BuildTriangles(HairInput hair,ID3D12GraphicsCommandList4* supplied,const Ex
         auto& idle=ctx.leases[i];
         if(!Available(idle)||!idle.vertices||idle.capacity>=hair.plan.bytes)continue;
         idle.vertices.Reset();ctx.stats.geometryBytes-=idle.capacity;idle.capacity=0;++ctx.stats.poolReleases;
-        if(allocate(idle,hair.plan.bytes))chosen=i;
+        if(allocate(idle,hair.plan.bytes,ctx.poolBudget))chosen=i;
+    }
+    // The budget is held by buffers still in flight (a load: the old area's
+    // recordings run while the new hair is built). The game does not retry a
+    // refused build, so grow past the budget into free video memory, up to the
+    // ceiling. Idle buffers return within kIdleReleaseMs afterwards.
+    if(chosen==kMaxLeases)if(const size_t i=empty();i!=kMaxLeases) {
+        const uint64_t headroom=VramHeadroom(),limit=std::min(ctx.poolCeiling,ctx.stats.geometryBytes+headroom);
+        if(allocate(ctx.leases[i],preferred,limit)||(preferred>hair.plan.bytes&&allocate(ctx.leases[i],hair.plan.bytes,limit))) {
+            chosen=i;++ctx.stats.poolGrowths;
+            if(poolGrowthLogs.fetch_add(1,std::memory_order_relaxed)<16) {
+                const auto pool=PoolUse();wchar_t line[256]{};
+                swprintf_s(line,L"WITCHER_DOTS hair vertex pool past its %llu MiB budget (buffers in flight): %llu MiB in %u buffers, %u in flight; VRAM headroom %llu MiB",
+                    ctx.poolBudget>>20,ctx.stats.geometryBytes>>20,pool.buffers,pool.busy,headroom>>20);
+                single_module::Log(line);
+            }
+        }
     }
     if(chosen==kMaxLeases) {
-        char text[160]{};
-        _snprintf_s(text,_TRUNCATE,"geometry pool unavailable (%llu MiB needed, %llu MiB pooled)",hair.plan.bytes>>20,ctx.stats.geometryBytes>>20);
+        const auto pool=PoolUse();char text[224]{};
+        _snprintf_s(text,_TRUNCATE,"geometry pool unavailable (%llu MiB needed, %llu MiB pooled in %u buffers, %u in flight; VRAM headroom %llu MiB)",
+            hair.plan.bytes>>20,ctx.stats.geometryBytes>>20,pool.buffers,pool.busy,VramHeadroom()>>20);
         error=text;Reject();return false;
     }
     const uint64_t now=GetTickCount64();
