@@ -6,6 +6,7 @@
 #include <d3d12.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdarg>
@@ -69,6 +70,11 @@ struct Region
     uint32_t width = 0;
     uint32_t height = 0;
 };
+
+// A retired resource and the tick after which every command list that could
+// still reference it — ours and the game's — has certainly finished.
+constexpr uint64_t kRetireHoldMs = 500;
+struct RetiredChild { ComPtr<ID3D12DeviceChild> object; uint64_t readyTick = 0; };
 
 struct State
 {
@@ -136,8 +142,11 @@ struct State
     uint32_t colorSpace = 0;
 
     // Resources a submitted game command list may still reference. They are
-    // never released, so a late or repeated execution cannot write freed memory.
-    std::vector<ComPtr<ID3D12DeviceChild>> retired;
+    // held until kRetireHoldMs has passed — long enough that a late or repeated
+    // execution cannot write freed memory — then released, so repeated device or
+    // layout changes (e.g. Frame Generation restarting around a game menu) no
+    // longer leak capture buffers for the process lifetime.
+    std::vector<RetiredChild> retired;
 
     // Results.
     hd::Aggregator aggregator;
@@ -394,9 +403,22 @@ bool SameLayout(const TileBuffer& buffer, uint32_t format, const hd::TileLayout&
     return buffer.markerOffset == Align(offset, 256);
 }
 
+void RetireChild(ComPtr<ID3D12DeviceChild> object) noexcept
+{
+    if (object) gState.retired.push_back(RetiredChild{std::move(object), GetTickCount64() + kRetireHoldMs});
+}
+
+void ReclaimRetired() noexcept
+{
+    if (gState.retired.empty()) return;
+    const uint64_t now = GetTickCount64();
+    gState.retired.erase(std::remove_if(gState.retired.begin(), gState.retired.end(),
+        [now](const RetiredChild& entry) { return now >= entry.readyTick; }), gState.retired.end());
+}
+
 void Retire(TileBuffer& buffer) noexcept
 {
-    if (buffer.buffer) gState.retired.push_back(std::move(buffer.buffer));
+    RetireChild(std::move(buffer.buffer));
     buffer = {};
 }
 
@@ -633,11 +655,11 @@ bool EnsurePresentResources(ID3D12Device* device, uint32_t format) noexcept
     {
         // A previous device's capture may still be executing.
         for (auto& buffer : gState.finals) Retire(buffer);
-        if (gState.fence) gState.retired.push_back(std::move(gState.fence));
-        if (gState.list) gState.retired.push_back(std::move(gState.list));
+        if (gState.fence) RetireChild(std::move(gState.fence));
+        if (gState.list) RetireChild(std::move(gState.list));
         for (auto& allocator : gState.allocators)
-            if (allocator) gState.retired.push_back(std::move(allocator));
-        if (gState.heldHudless) gState.retired.push_back(std::move(gState.heldHudless));
+            if (allocator) RetireChild(std::move(allocator));
+        if (gState.heldHudless) RetireChild(std::move(gState.heldHudless));
         gState.presentDevice.Reset();
         gState.fenceValues = {};
         gState.nextFence = 1;
@@ -1107,6 +1129,7 @@ void CapturePresent(ID3D12Device* device, ID3D12CommandQueue* queue,
 {
     if (!device || !queue || !backbuffer || !WantsPresentCapture()) return;
     std::lock_guard lock(gState.mutex);
+    ReclaimRetired();
     const Stage stage = CurrentStage();
     if (stage != Stage::eHudlessRecorded && stage != Stage::eHudlessDeferred
         && stage != Stage::eCapturing) return;

@@ -6,6 +6,7 @@
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstring>
@@ -135,8 +136,24 @@ ComPtr<ID3DBlob> gVertexShader;
 ComPtr<ID3DBlob> gPixelShader;
 ComPtr<ID3DBlob> gSynthShader;
 ComPtr<ID3DBlob> gSynthBoundShader;
-// Objects a submitted command list may still reference are never released.
-std::vector<ComPtr<ID3D12DeviceChild>> gRetired;
+// Objects a submitted command list may still reference. They are held until
+// enough time has passed that every command list recorded before retirement —
+// both our passes (gPipe.fence) and the game's tagging lists that write the tag
+// copies — has certainly finished, then released. Without this drain the tint
+// and recomposition textures accumulate for the process lifetime: restarting
+// Frame Generation (e.g. The Witcher 3 toggling it around its menu) churns these
+// full-resolution copies and leaks a batch of VRAM every cycle.
+constexpr uint64_t kRetireHoldMs = 500;
+struct Retired { ComPtr<ID3D12DeviceChild> object; uint64_t readyTick = 0; };
+std::vector<Retired> gRetired;
+
+void ReclaimRetired() noexcept
+{
+    if (gRetired.empty()) return;
+    const uint64_t now = GetTickCount64();
+    gRetired.erase(std::remove_if(gRetired.begin(), gRetired.end(),
+        [now](const Retired& entry) { return now >= entry.readyTick; }), gRetired.end());
+}
 
 constexpr char kVertexShader[] =
     "float4 main(uint id : SV_VertexID) : SV_Position\n"
@@ -302,7 +319,7 @@ D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* resource, UINT before, UINT af
 
 template <class T> void Retire(ComPtr<T>& object) noexcept
 {
-    if (object) gRetired.push_back(std::move(object));
+    if (object) gRetired.push_back(Retired{std::move(object), GetTickCount64() + kRetireHoldMs});
     object.Reset();
 }
 
@@ -832,6 +849,7 @@ void ObserveHudless(void* resource, uint32_t state, uint32_t lifecycle,
 {
     if (!WantsHudless() || !resource) return;
     std::lock_guard lock(gMutex);
+    ReclaimRetired();
     ComPtr<ID3D12Resource> texture;
     if (FAILED(static_cast<IUnknown*>(resource)->QueryInterface(IID_PPV_ARGS(&texture))) || !texture)
         return SetStatus(Status::eUnsupported);
@@ -902,6 +920,7 @@ void Draw(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Resource* backb
 {
     if (!Enabled() || !device || !queue || !backbuffer) return;
     std::lock_guard lock(gMutex);
+    ReclaimRetired();
     if (gBroken) return SetStatus(Status::eFailed);
     if (!gLatest.sequence) return SetStatus(Status::eWaiting);
     // A Present-time HUDless is read once, at the Present it was tagged for.
@@ -1008,6 +1027,7 @@ void SynthesizeUi(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Resourc
     const UiTagger tagger = gTagger.load(std::memory_order_acquire);
     if (!tagger) return SetSynthStatus(SynthStatus::eNoTagger);
     std::lock_guard lock(gMutex);
+    ReclaimRetired();
     uint32_t present = hudless_probe::kNoFrame;
     if (!hudless_probe::CurrentPresentFrame(present)) present = hudless_probe::kNoFrame;
     // Tags the last derived alpha again for this Present.
