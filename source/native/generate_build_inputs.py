@@ -15,8 +15,8 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest().upper()
 if digest(imgui / 'backends/imgui_impl_dx12.cpp') != '4932F938C6D48EDF91B45078CF0BDD0BF9AD46CC5D4B9A48873528046DA7C580':
     raise RuntimeError('Expected the pinned ImGui DX12 backend')
-if digest(glslang) != '8F0838D3FD981D4086D81675C4CFA4381691AEAFC3651D12D62F61EF0CEBB33E':
-    raise RuntimeError('Expected glslangValidator from Vulkan SDK 1.2.176.1')
+if digest(glslang) != '6BD05727F6C2B71DBF6732DCB45CD35125D668CB858FD0BC237D23FB27AADAB3':
+    raise RuntimeError('Expected the locally built glslangValidator (glslang 18eef33, Vulkan SDK 1.2.176.1 revision)')
 families = []
 for line in (source_dir / 'proxy_exports.txt').read_text(encoding='utf-8').splitlines():
     if not line or line.startswith('#'):

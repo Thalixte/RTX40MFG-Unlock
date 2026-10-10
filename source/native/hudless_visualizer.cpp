@@ -916,6 +916,12 @@ void ObserveHudless(void* resource, uint32_t state, uint32_t lifecycle,
     gLatest = std::move(next);
 }
 
+void Reclaim() noexcept
+{
+    std::lock_guard lock(gMutex);
+    ReclaimRetired();
+}
+
 void Draw(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Resource* backbuffer) noexcept
 {
     if (!Enabled() || !device || !queue || !backbuffer) return;

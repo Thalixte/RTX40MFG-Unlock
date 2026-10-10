@@ -37,6 +37,8 @@ void ObserveHudless(void* resource, uint32_t state, uint32_t lifecycle,
     void* commandList, uint32_t frame) noexcept;
 // True while the tint or UI synthesis needs HUDless images.
 bool WantsHudless() noexcept;
+// Releases retired objects; call every Present, even while the feature is idle.
+void Reclaim() noexcept;
 
 // Present (before the menu draws): tints the application backbuffer, which is
 // in PRESENT state, on the presentation queue.

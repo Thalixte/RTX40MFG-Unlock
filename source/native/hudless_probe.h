@@ -70,6 +70,8 @@ bool CurrentPresentFrame(uint32_t& frame) noexcept;
 bool WantsPresentCapture() noexcept;
 void CapturePresent(ID3D12Device* device, ID3D12CommandQueue* queue,
     ID3D12Resource* backbuffer, uint32_t colorSpace) noexcept;
+// Releases retired objects; call every Present, even while capture is idle.
+void Reclaim() noexcept;
 
 // Worker thread: arms probes, evaluates completed readbacks, logs results.
 void Poll() noexcept;

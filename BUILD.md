@@ -52,6 +52,19 @@ installation are enabled, with the existing bounded NGX Create result log.
 GPU fault capture, menu suppression, skipped GPU work and test fault injection
 remain disabled. Do not enable those diagnostic switches for a release build.
 
+Without the kernel cache, replace `-NativeCacheRoot` with `-PtxOnly` to build an
+unofficial DLL with no embedded SM86 kernels. On RTX 30 GPUs it uses the PTX
+derived from the provider at runtime, and the NVIDIA driver compiles it on first
+load (later loads reuse the driver's compute cache). Its hash will not match
+the release DLL.
+
+With `-PtxOnly` you may also pass `-UnpinnedToolchain` to accept a different
+CMake (3.24 or newer, including the copy bundled with Visual Studio) and MSVC,
+for example Visual Studio 2022 Community. Pass `-VisualStudioInstance`,
+`-MsvcToolsVersion` and `-CMakeExecutable` for your installation, and
+`-VisualStudioVersion` (from `Common7/IDE/devenv.isolation.ini`) if CMake
+reports that the instance is unknown to the Visual Studio Installer.
+
 The proxy dispatchers, Vulkan shader arrays and adapted ImGui DX12 backend are
 generated in the build directory. Their normalized SHA-256 values must match
 `source/native/generated_sha256.json`. The fixed export map is recorded in

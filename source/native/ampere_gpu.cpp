@@ -32,6 +32,51 @@ namespace ampere_gpu
 {
 namespace
 {
+
+#if defined(MFG_AMPERE_TRACE_PTX_IDENTITY) && MFG_AMPERE_TRACE_PTX_IDENTITY
+// Diagnostics only: hash the same de-padded SM86 PTX payload as LoadProgramUsing.
+// Never log PTX bytes, addresses or user information.
+static void TraceAmperePtxIdentities(const ampere_native_cache::CompleteProgram& program)
+{
+    for (size_t slot = 0; slot < program.size(); ++slot)
+    {
+        const auto& image = program[slot];
+        if (image.size() < 80) { Log(L"PTX_ID slot=%zu invalid=short", slot); continue; }
+        auto u16 = [&](size_t p) { uint16_t v = 0; std::memcpy(&v, image.data()+p, 2); return v; };
+        auto u32 = [&](size_t p) { uint32_t v = 0; std::memcpy(&v, image.data()+p, 4); return v; };
+        auto u64 = [&](size_t p) { uint64_t v = 0; std::memcpy(&v, image.data()+p, 8); return v; };
+        const size_t outer = u16(6);
+        if (u32(0) != 0xba55ed50 || u16(4) != 1 || outer != 16 ||
+            u64(8) != image.size()-outer || u16(16) != 1 || u16(18) != 0x101 ||
+            u32(20) < 64 || u32(44) != 86 || u64(56) != 0x41 ||
+            u32(20) > image.size()-outer ||
+            u64(24) != image.size()-outer-u32(20) || (u64(24)&7))
+        { Log(L"PTX_ID slot=%zu invalid=shape", slot); continue; }
+        const size_t offset = outer + u32(20);
+        size_t bytes = static_cast<size_t>(u64(24));
+        while (bytes && image[offset+bytes-1] == 0) --bytes;
+        if (!bytes) { Log(L"PTX_ID slot=%zu invalid=empty", slot); continue; }
+        BCRYPT_ALG_HANDLE algorithm = nullptr;
+        BCRYPT_HASH_HANDLE hash = nullptr;
+        unsigned char digest[32]{};
+        bool ok = BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) >= 0;
+        if (ok) ok = BCryptCreateHash(algorithm, &hash, nullptr, 0, nullptr, 0, 0) >= 0;
+        if (ok) ok = BCryptHashData(hash, const_cast<PUCHAR>(image.data()+offset),
+            static_cast<ULONG>(bytes), 0) >= 0;
+        if (ok) ok = BCryptFinishHash(hash, digest, sizeof(digest), 0) >= 0;
+        if (hash) BCryptDestroyHash(hash);
+        if (algorithm) BCryptCloseAlgorithmProvider(algorithm);
+        if (!ok) { Log(L"PTX_ID slot=%zu error=sha256", slot); continue; }
+        constexpr char digits[] = "0123456789ABCDEF";
+        char hex[65]{};
+        for (size_t j = 0; j < 32; ++j) {
+            hex[j*2] = digits[digest[j] >> 4]; hex[j*2+1] = digits[digest[j] & 15];
+        }
+        Log(L"PTX_ID slot=%zu arch=86 payload_bytes=%zu sha256=%S", slot, bytes, hex);
+    }
+}
+#endif
+
 constexpr size_t kKernelCount = 25;
 constexpr size_t kMaximumKernelCount = ampere_native_cache::kMaximumSlots;
 constexpr size_t kDescriptorBytes = 48;
@@ -1512,12 +1557,31 @@ bool PatchProvider(HMODULE module, const wchar_t* path, const PreparationBoundar
             uint32_t outputSize = 0;
             StripFailure reason{};
             gPreparation.store(Preparation::ePtxTransform);
-            if (!BuildAmpereSm86Fatbin(fatbin, supplied, meta, ptxProgram[i].data(),
-                    capacity, scratch.data(), scratch.size(), outputSize, reason, temporal,
+
+            if (!BuildAmpereSm86Fatbin(
+                    fatbin, supplied, meta, ptxProgram[i].data(),
+                    capacity, scratch.data(), scratch.size(),
+                    outputSize, reason, temporal,
                     i == 14 && profile->temporalSlot == 9))
-            { discard(); return fail(Failure::eDecompression); }
+            {
+                Log(
+                    L"Ampere PTX transform failed: slot=%zu reason=%u "
+                    L"temporal=%u rawBytes=%zu suppliedBytes=%llu",
+                    i,
+                    static_cast<unsigned>(reason),
+                    static_cast<unsigned>(temporal != nullptr),
+                    static_cast<size_t>(meta.rawPtxBytes),
+                    static_cast<unsigned long long>(supplied)
+                );
+
+                discard();
+                return fail(Failure::eDecompression);
+            }
             ptxProgram[i].resize(outputSize);
         }
+#if defined(MFG_AMPERE_TRACE_PTX_IDENTITY) && MFG_AMPERE_TRACE_PTX_IDENTITY
+        TraceAmperePtxIdentities(ptxProgram);
+#endif
         gPreparation.store(Preparation::eNativeCache);
         const auto mode = ampere_native_cache::ConfiguredMode();
         if (mode != ampere_native_cache::Mode::ePtx)

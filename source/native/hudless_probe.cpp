@@ -1124,6 +1124,12 @@ bool WantsPresentCapture() noexcept
         || stage == Stage::eCapturing;
 }
 
+void Reclaim() noexcept
+{
+    std::lock_guard lock(gState.mutex);
+    ReclaimRetired();
+}
+
 void CapturePresent(ID3D12Device* device, ID3D12CommandQueue* queue,
     ID3D12Resource* backbuffer, uint32_t colorSpace) noexcept
 {

@@ -1,5 +1,8 @@
 ﻿param(
-    [Parameter(Mandatory = $true)][string]$NativeCacheRoot,
+    [string]$NativeCacheRoot,
+    [switch]$PtxOnly,
+    [switch]$UnpinnedToolchain,
+    [string]$VisualStudioVersion,
     [Parameter(Mandatory = $true)][string]$StreamlineRoot,
     [Parameter(Mandatory = $true)][string]$ImGuiRoot,
     [string]$VulkanIncludeDirectory = 'C:/VulkanSDK/1.2.176.1/Include',
@@ -42,11 +45,17 @@ function Assert-InputHash {
     }
 }
 
+if ($PtxOnly.IsPresent -eq [bool]$NativeCacheRoot) {
+    throw 'Supply exactly one of -NativeCacheRoot (release build) or -PtxOnly (unofficial build without SM86 kernels)'
+}
+
 $sourceDirectory = $PSScriptRoot
-$frozenCandidate = $NativeCacheRoot
-$nativeCache = Join-Path $frozenCandidate 'native-cache'
-$nativeCache3109 = Join-Path $frozenCandidate 'native-cache-3109'
-$nativeCacheAdditional = Join-Path $frozenCandidate 'all-provider-layouts/native-cache-complete'
+if (-not $PtxOnly) {
+    $frozenCandidate = $NativeCacheRoot
+    $nativeCache = Join-Path $frozenCandidate 'native-cache'
+    $nativeCache3109 = Join-Path $frozenCandidate 'native-cache-3109'
+    $nativeCacheAdditional = Join-Path $frozenCandidate 'all-provider-layouts/native-cache-complete'
+}
 $msvcRoot = Join-Path $VisualStudioInstance "VC/Tools/MSVC/$MsvcToolsVersion"
 $compiler = Join-Path $msvcRoot 'bin/Hostx64/x64/cl.exe'
 $linker = Join-Path $msvcRoot 'bin/Hostx64/x64/link.exe'
@@ -55,10 +64,20 @@ $windowsKits = 'C:/Program Files (x86)/Windows Kits/10'
 $windowsHeader = Join-Path $windowsKits "Include/$WindowsSdkVersion/um/Windows.h"
 $windowsKernelLibrary = Join-Path $windowsKits "Lib/$WindowsSdkVersion/um/x64/kernel32.lib"
 
-Assert-InputHash $CMakeExecutable '70FA92CE2AC9F54B0AE395B0B3790D9147EF2EBDBD7C4E0BB20852AAC581BAEA'
-Assert-InputHash $compiler '6D23D795315737B52325B15308A72F59C54F68CB9812E6859B1113564FCCFF58'
-Assert-InputHash $linker 'D78A3A29C27E7949A164386A92FC6EB51F8074E5AF248DC574196D49AEC93E3E'
-Assert-InputHash $assembler 'B7F1B51EBA109E3AA1EE9C805D7FFEB08D9589578D6F487F1ACD6A8389796D43'
+if ($UnpinnedToolchain -and -not $PtxOnly) {
+    throw '-UnpinnedToolchain is only allowed with -PtxOnly'
+}
+if ($UnpinnedToolchain) {
+    foreach ($tool in @($CMakeExecutable, $compiler, $linker, $assembler)) {
+        if (-not (Test-Path -LiteralPath $tool -PathType Leaf)) { throw "Missing build tool: $tool" }
+    }
+    Write-Warning 'Unpinned toolchain: CMake/MSVC identities are not verified'
+} else {
+    Assert-InputHash $CMakeExecutable '70FA92CE2AC9F54B0AE395B0B3790D9147EF2EBDBD7C4E0BB20852AAC581BAEA'
+    Assert-InputHash $compiler '6D23D795315737B52325B15308A72F59C54F68CB9812E6859B1113564FCCFF58'
+    Assert-InputHash $linker 'D78A3A29C27E7949A164386A92FC6EB51F8074E5AF248DC574196D49AEC93E3E'
+    Assert-InputHash $assembler 'B7F1B51EBA109E3AA1EE9C805D7FFEB08D9589578D6F487F1ACD6A8389796D43'
+}
 Assert-InputHash $windowsHeader 'B337D661D03A4ABEFB7B86A2742CE1AD5D19B57CD8B858BD13E7BBCC1DBEEAAA'
 Assert-InputHash $windowsKernelLibrary '25346E02CFFCA92ABFF07000D54E1830FE0D8861C31A114EDA472547FE9F2F00'
 Assert-InputHash (Join-Path $sourceDirectory 'ampere_font_native.inc') 'DB74E405A13D82EA9353EDBD840722D9923317FFD029E2F703E668B3D9F93441' -NormalizeText
@@ -100,12 +119,14 @@ Assert-InputHash (Join-Path $VulkanIncludeDirectory 'vulkan/vulkan.h') '44410C06
 Assert-InputHash (Join-Path $VulkanIncludeDirectory 'vulkan/vk_platform.h') '9FC121C475DE911518D1975352D3ED6320B3CDDD7D7E28B5E2D89B91E6BD9981'
 Assert-InputHash (Join-Path $VulkanIncludeDirectory 'vulkan/vulkan_core.h') '0C7E4D78E18170758BC4EB15C78065237A0A083211EAE1DF89020E3C954AD79F'
 Assert-InputHash (Join-Path $VulkanIncludeDirectory 'vulkan/vulkan_win32.h') '39F7E94FEA15B8391898DBEF6930C21AC13D59D4DE0298023B99D855068C06F6'
-Assert-InputHash (Join-Path $nativeCache 'ampere_native_manifest.inc') '4C8765C79A4947A7F3A79EC98DB2DB7E3E95584621E853909BF5EDB2DA7D2C24'
-Assert-InputHash (Join-Path $nativeCache3109 'ampere_native_manifest.inc') '90E3E797B5121B6FFBF52C1765FAC9683A9C1641363EE0CC669296754B4B2291'
-Assert-InputHash (Join-Path $nativeCache 'manifest.json') 'B90F4131CD7E9E93C164FE2680C29475EFA2434DD6CF343C8713FCE4E2557E09'
-Assert-InputHash (Join-Path $nativeCache3109 'manifest.json') 'D6D42F8BC002B29833EDE69E27DBC00E6E2913716BC6131DBAE19D02215E58D9'
-Assert-InputHash (Join-Path $nativeCacheAdditional 'ampere_native_manifest_additional.inc') '1E0770EA6C85B4267E1068D16A723845D4AB949FA0BC142D2DFF2C24E88C9F64'
-Assert-InputHash (Join-Path $nativeCacheAdditional 'additional-resources.json') '0007B3CCBC3D3B3ACE90DF4B438050013EE31DE8B6069AF1A39DCA5B7DAE7EDD'
+if (-not $PtxOnly) {
+    Assert-InputHash (Join-Path $nativeCache 'ampere_native_manifest.inc') '4C8765C79A4947A7F3A79EC98DB2DB7E3E95584621E853909BF5EDB2DA7D2C24'
+    Assert-InputHash (Join-Path $nativeCache3109 'ampere_native_manifest.inc') '90E3E797B5121B6FFBF52C1765FAC9683A9C1641363EE0CC669296754B4B2291'
+    Assert-InputHash (Join-Path $nativeCache 'manifest.json') 'B90F4131CD7E9E93C164FE2680C29475EFA2434DD6CF343C8713FCE4E2557E09'
+    Assert-InputHash (Join-Path $nativeCache3109 'manifest.json') 'D6D42F8BC002B29833EDE69E27DBC00E6E2913716BC6131DBAE19D02215E58D9'
+    Assert-InputHash (Join-Path $nativeCacheAdditional 'ampere_native_manifest_additional.inc') '1E0770EA6C85B4267E1068D16A723845D4AB949FA0BC142D2DFF2C24E88C9F64'
+    Assert-InputHash (Join-Path $nativeCacheAdditional 'additional-resources.json') '0007B3CCBC3D3B3ACE90DF4B438050013EE31DE8B6069AF1A39DCA5B7DAE7EDD'
+}
 
 if (-not (Test-Path -LiteralPath (Join-Path $sourceDirectory 'CMakeLists.txt') -PathType Leaf)) {
     throw "Corrected source snapshot is incomplete: $sourceDirectory"
@@ -118,9 +139,7 @@ $arguments = @(
     '-S', $sourceDirectory,
     '-B', $BuildDirectory,
     '-G', 'Visual Studio 17 2022',
-    '-A', "x64,version=$WindowsSdkVersion",
     '-T', 'v143',
-    "-DCMAKE_GENERATOR_INSTANCE=$VisualStudioInstance",
     "-DCMAKE_VS_GLOBALS=VCToolsVersion=$MsvcToolsVersion",
     "-DSTREAMLINE_ROOT=$StreamlineRoot",
     "-DIMGUI_ROOT=$ImGuiRoot",
@@ -140,17 +159,36 @@ $arguments = @(
     '-DMFG_UNLOCK_OUTPUT_PULL_EXPERIMENT=OFF',
     '-DMFG_UNLOCK_OUTPUT_PULL_TELEMETRY=OFF',
     '-DMFG_UNLOCK_PREV2CURR_EXPERIMENT=OFF',
-    '-DMFG_UNLOCK_INTERM_SCATTER_EXPERIMENT=OFF',
-    '-DMFG_AMPERE_EMBEDDED_KERNELS=ON',
-    '-DMFG_AMPERE_KERNEL_IMAGE=AUTO',
-    "-DMFG_AMPERE_NATIVE_MANIFEST=$(Join-Path $nativeCache 'ampere_native_manifest.inc')",
-    "-DMFG_AMPERE_KERNEL_DIRECTORY=$(Join-Path $nativeCache 'RTX30MFG-Kernels')",
-    "-DMFG_AMPERE_NATIVE_MANIFEST_3109=$(Join-Path $nativeCache3109 'ampere_native_manifest.inc')",
-    "-DMFG_AMPERE_KERNEL_DIRECTORY_3109=$(Join-Path $nativeCache3109 'RTX30MFG-Kernels')",
-    "-DMFG_AMPERE_NATIVE_MANIFEST_ADDITIONAL=$(Join-Path $nativeCacheAdditional 'ampere_native_manifest_additional.inc')",
-    "-DMFG_AMPERE_NATIVE_RESOURCES_ADDITIONAL=$(Join-Path $nativeCacheAdditional 'additional-resources.json')",
-    "-DMFG_AMPERE_KERNEL_DIRECTORY_ADDITIONAL=$(Join-Path $nativeCacheAdditional 'RTX30MFG-Kernels')"
+    '-DMFG_UNLOCK_INTERM_SCATTER_EXPERIMENT=OFF'
 )
+if ($UnpinnedToolchain) {
+    # Older CMake (such as the copy bundled with Visual Studio) rejects the
+    # "x64,version=" platform form; CMAKE_SYSTEM_VERSION selects the same SDK.
+    # A version is needed when the VS Installer cannot enumerate the instance.
+    $instance = if ($VisualStudioVersion) { "$VisualStudioInstance,version=$VisualStudioVersion" } else { $VisualStudioInstance }
+    $arguments += @('-A', 'x64', "-DCMAKE_SYSTEM_VERSION=$WindowsSdkVersion", "-DCMAKE_GENERATOR_INSTANCE=$instance")
+} else {
+    $arguments += @('-A', "x64,version=$WindowsSdkVersion", "-DCMAKE_GENERATOR_INSTANCE=$VisualStudioInstance")
+}
+if ($PtxOnly) {
+    $arguments += @(
+        '-DMFG_UNLOCK_PTX_ONLY=ON',
+        '-DMFG_AMPERE_EMBEDDED_KERNELS=OFF',
+        '-DMFG_AMPERE_KERNEL_IMAGE=PTX'
+    )
+} else {
+    $arguments += @(
+        '-DMFG_AMPERE_EMBEDDED_KERNELS=ON',
+        '-DMFG_AMPERE_KERNEL_IMAGE=AUTO',
+        "-DMFG_AMPERE_NATIVE_MANIFEST=$(Join-Path $nativeCache 'ampere_native_manifest.inc')",
+        "-DMFG_AMPERE_KERNEL_DIRECTORY=$(Join-Path $nativeCache 'RTX30MFG-Kernels')",
+        "-DMFG_AMPERE_NATIVE_MANIFEST_3109=$(Join-Path $nativeCache3109 'ampere_native_manifest.inc')",
+        "-DMFG_AMPERE_KERNEL_DIRECTORY_3109=$(Join-Path $nativeCache3109 'RTX30MFG-Kernels')",
+        "-DMFG_AMPERE_NATIVE_MANIFEST_ADDITIONAL=$(Join-Path $nativeCacheAdditional 'ampere_native_manifest_additional.inc')",
+        "-DMFG_AMPERE_NATIVE_RESOURCES_ADDITIONAL=$(Join-Path $nativeCacheAdditional 'additional-resources.json')",
+        "-DMFG_AMPERE_KERNEL_DIRECTORY_ADDITIONAL=$(Join-Path $nativeCacheAdditional 'RTX30MFG-Kernels')"
+    )
+}
 
 & $CMakeExecutable @arguments
 if ($LASTEXITCODE -ne 0) { throw "CMake configure failed: $LASTEXITCODE" }
@@ -178,14 +216,22 @@ function Assert-CachePath([string]$Name, [string]$Expected) {
 }
 
 Assert-CacheValue 'CMAKE_GENERATOR' 'Visual Studio 17 2022'
-Assert-CachePath 'CMAKE_GENERATOR_INSTANCE' $VisualStudioInstance
 Assert-CacheValue 'CMAKE_GENERATOR_TOOLSET' 'v143'
-Assert-CacheValue 'CMAKE_GENERATOR_PLATFORM' "x64,version=$WindowsSdkVersion"
 Assert-CacheValue 'CMAKE_VS_GLOBALS' "VCToolsVersion=$MsvcToolsVersion"
-Assert-CachePath 'CMAKE_ASM_MASM_COMPILER' $assembler
-Assert-CachePath 'MFG_AMPERE_NATIVE_MANIFEST_ADDITIONAL' (Join-Path $nativeCacheAdditional 'ampere_native_manifest_additional.inc')
-Assert-CachePath 'MFG_AMPERE_NATIVE_RESOURCES_ADDITIONAL' (Join-Path $nativeCacheAdditional 'additional-resources.json')
-Assert-CachePath 'MFG_AMPERE_KERNEL_DIRECTORY_ADDITIONAL' (Join-Path $nativeCacheAdditional 'RTX30MFG-Kernels')
+if (-not $UnpinnedToolchain) {
+    Assert-CachePath 'CMAKE_GENERATOR_INSTANCE' $VisualStudioInstance
+    Assert-CacheValue 'CMAKE_GENERATOR_PLATFORM' "x64,version=$WindowsSdkVersion"
+    Assert-CachePath 'CMAKE_ASM_MASM_COMPILER' $assembler
+}
+if ($PtxOnly) {
+    Assert-CacheValue 'MFG_UNLOCK_PTX_ONLY' 'ON'
+    Assert-CacheValue 'MFG_AMPERE_EMBEDDED_KERNELS' 'OFF'
+    Assert-CacheValue 'MFG_AMPERE_KERNEL_IMAGE' 'PTX'
+} else {
+    Assert-CachePath 'MFG_AMPERE_NATIVE_MANIFEST_ADDITIONAL' (Join-Path $nativeCacheAdditional 'ampere_native_manifest_additional.inc')
+    Assert-CachePath 'MFG_AMPERE_NATIVE_RESOURCES_ADDITIONAL' (Join-Path $nativeCacheAdditional 'additional-resources.json')
+    Assert-CachePath 'MFG_AMPERE_KERNEL_DIRECTORY_ADDITIONAL' (Join-Path $nativeCacheAdditional 'RTX30MFG-Kernels')
+}
 Assert-CacheValue 'MFG_UNLOCK_OVERLAY_SKIP_GPU_WORK' $SkipOverlayGpuWork.IsPresent.ToString().ToUpperInvariant()
 Assert-CacheValue 'MFG_UNLOCK_NGX_CREATE_RESULT_DIAGNOSTICS' $EnableNgxCreateResultDiagnostics.IsPresent.ToString().ToUpperInvariant()
 Assert-CacheValue 'MFG_UNLOCK_OUTPUT_PULL_MASK_ONLY' 'ON'
@@ -213,7 +259,11 @@ if (-not $compilerMetadata) { throw 'CMake did not emit C++ compiler metadata.' 
 $compilerText = Get-Content -LiteralPath $compilerMetadata.FullName -Raw
 $compilerRecord = 'set(CMAKE_CXX_COMPILER "' + $compiler.Replace('\', '/') + '")'
 $linkerRecord = 'set(CMAKE_LINKER "' + $linker.Replace('\', '/') + '")'
-if (-not $compilerText.Contains($compilerRecord) `
+if ($UnpinnedToolchain) {
+    if ($compilerText -notmatch 'set\(CMAKE_CXX_COMPILER_ARCHITECTURE_ID "?x64"?\)') {
+        throw "Configured compiler does not target x64: $($compilerMetadata.FullName)"
+    }
+} elseif (-not $compilerText.Contains($compilerRecord) `
     -or -not $compilerText.Contains($linkerRecord) `
     -or -not $compilerText.Contains('set(CMAKE_CXX_COMPILER_VERSION "19.38.33135.0")') `
     -or -not $compilerText.Contains('set(CMAKE_CXX_COMPILER_ARCHITECTURE_ID "x64")')) {

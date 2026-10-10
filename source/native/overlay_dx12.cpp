@@ -533,6 +533,8 @@ bool BeginPresent(Session* session, UINT flags, bool partialUpdate) noexcept
     if (session->resizing || session->retired) return false;
     ++session->presents;
     if (session->presents != 1) return true; // Concurrent calls forward; only one UI submission can own a frame.
+    hudless_probe::Reclaim();
+    hudless_visualizer::Reclaim();
     if ((flags & DXGI_PRESENT_TEST) || ((flags & DXGI_PRESENT_DO_NOT_WAIT) && session->wasStillDrawing)) return true;
     if (!Principal(session)) return true;
     gDxgiFrames.fetch_add(1, std::memory_order_relaxed);

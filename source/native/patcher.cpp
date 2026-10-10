@@ -50,6 +50,8 @@ inline bool UseAmpere() noexcept { return gpu_dispatch::IsAmpere(); }
 #include <Windows.h>
 #include <TlHelp32.h>
 #include <d3d12.h>
+#include <dxgi1_4.h>
+#include <wrl/client.h>
 #include <winternl.h>
 #include <sl.h>
 #include <sl_dlss_g.h>
@@ -8670,6 +8672,70 @@ bool RegisterDllNotification()
     return registered;
 }
 
+// Logs this process's local VRAM on the game's adapter whenever it moves by 32 MiB
+// or a frame-generation counter changes, so growth can be tied to a transition.
+void TraceProcessVram(uint64_t nowTick) noexcept
+{
+    static Microsoft::WRL::ComPtr<IDXGIAdapter3> adapter;
+    static uint64_t adapterLuid = 0;
+    static uint64_t nextTick = 0;
+    static int64_t lastMiB = -1;
+    static bool lastOn = false;
+    static uint64_t lastCreates = 0, lastFrees = 0;
+    if (nowTick < nextTick)
+        return;
+    nextTick = nowTick + 500;
+    const uint64_t luid = gpu_dispatch::AdapterLuid();
+    if (!luid)
+        return;
+    if (!adapter || adapterLuid != luid)
+    {
+        adapter.Reset();
+        using CreateFactory1 = HRESULT(WINAPI*)(REFIID, void**);
+        HMODULE dxgi = LoadLibraryExW(L"dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        auto* create = dxgi ? reinterpret_cast<CreateFactory1>(
+            GetProcAddress(dxgi, "CreateDXGIFactory1")) : nullptr;
+        Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
+        Microsoft::WRL::ComPtr<IDXGIAdapter1> found;
+        LUID id{};
+        id.LowPart = static_cast<DWORD>(luid);
+        id.HighPart = static_cast<LONG>(luid >> 32);
+        if (!create || FAILED(create(IID_PPV_ARGS(&factory)))
+            || FAILED(factory->EnumAdapterByLuid(id, IID_PPV_ARGS(&found)))
+            || FAILED(found.As(&adapter)))
+        {
+            adapter.Reset();
+            nextTick = nowTick + 5000;
+            return;
+        }
+        adapterLuid = luid;
+    }
+    DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+    if (FAILED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)))
+        return;
+    ControlRouteRecord* route = ActiveControlRoute();
+    const bool on = gAppliedFrameGenerationOn.load(std::memory_order_relaxed);
+    const uint64_t sets = gSetOptionsCalls.load(std::memory_order_relaxed);
+    const uint64_t creates = gNgxFrameGenerationCreateCalls.load(std::memory_order_relaxed);
+    const uint64_t frees = route ? route->releaseCalls.load(std::memory_order_relaxed) : 0;
+    const int64_t miB = static_cast<int64_t>(info.CurrentUsage >> 20);
+    const bool moved = lastMiB < 0 || (miB > lastMiB ? miB - lastMiB : lastMiB - miB) >= 32;
+    // Plain option polling alone must not flood the log; only transitions count.
+    const bool changed = on != lastOn || creates != lastCreates || frees != lastFrees;
+    if (!moved && !changed)
+        return;
+    Log(L"VRAM_TRACE usageMiB=%lld budgetMiB=%llu deltaMiB=%lld fgOn=%d setOptionsCalls=%llu "
+        L"ngxFgCreates=%llu freeResources=%llu",
+        static_cast<long long>(miB), static_cast<unsigned long long>(info.Budget >> 20),
+        static_cast<long long>(lastMiB < 0 ? 0 : miB - lastMiB), on,
+        static_cast<unsigned long long>(sets), static_cast<unsigned long long>(creates),
+        static_cast<unsigned long long>(frees));
+    lastMiB = miB;
+    lastOn = on;
+    lastCreates = creates;
+    lastFrees = frees;
+}
+
 DWORD WINAPI PatchWorker(void* context)
 {
     EnsureAmpereFeatureLifetimeObserver();
@@ -8855,6 +8921,7 @@ DWORD WINAPI PatchWorker(void* context)
         single_module::DrainLog(&MidpointLog);
 #endif
         hudless_probe::Poll();
+        TraceProcessVram(GetTickCount64());
         ++inventoryTicks;
         if (gModuleInventoryDirty.exchange(false, std::memory_order_acq_rel))
         {

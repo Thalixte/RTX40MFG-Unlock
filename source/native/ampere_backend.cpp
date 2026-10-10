@@ -1370,6 +1370,27 @@ template<size_t I> NVSDK_NGX_Result NVSDK_CONV Release(NVSDK_NGX_Handle* handle)
 {
     std::unique_lock lock(gCalls);
     auto original = RouteOriginal<ReleaseFn>(gRoutes[I], gRoutes[I].release);
+    const auto releaseState = entry_detour::ReadSnapshot(gRoutes[I].release);
+    {
+        static std::atomic<uint32_t> enterLogs{0};
+        if (enterLogs.fetch_add(1, std::memory_order_relaxed) < 256)
+        {
+            wchar_t message[256]{};
+            swprintf_s(message, L"NGX_RELEASE_ENTER route=%zu runtime=%d original=%d handle=%p installed=%d current=%d "
+                L"failure=%u method=%u ownerMatch=%d generationMatch=%d",
+                I, gRoutes[I].runtime ? 1 : 0, original ? 1 : 0, handle, releaseState.installed ? 1 : 0,
+                releaseState.current ? 1 : 0, static_cast<uint32_t>(releaseState.failure),
+                static_cast<uint32_t>(releaseState.method), releaseState.owner == gRoutes[I].module ? 1 : 0,
+                releaseState.generation == gRoutes[I].generation ? 1 : 0);
+            Report(message);
+        }
+    }
+#if MFG_UNLOCK_RUNTIME_GPU_SELECTION
+    // This thunk only runs because the patch is live, so a stale "current" flag must not swallow a release.
+    if (!original && !gpu_dispatch::IsAmpere() && releaseState.installed && releaseState.original
+        && releaseState.owner == gRoutes[I].module)
+        original = reinterpret_cast<ReleaseFn>(releaseState.original);
+#endif
     if (!original) return NVSDK_NGX_Result_FAIL_NotInitialized;
     const uintptr_t handleValue = reinterpret_cast<uintptr_t>(handle);
 #if MFG_UNLOCK_RUNTIME_GPU_SELECTION
@@ -1390,6 +1411,13 @@ template<size_t I> NVSDK_NGX_Result NVSDK_CONV Release(NVSDK_NGX_Handle* handle)
         fault_capture::NgxCall call(entry, _ReturnAddress(), nullptr, handleValue, nullptr);
         const auto result = original(handle);
         call.Complete(static_cast<uint32_t>(result));
+        static std::atomic<uint32_t> releaseLogs{0};
+        if (releaseLogs.fetch_add(1, std::memory_order_relaxed) < 256)
+        {
+            wchar_t message[128]{};
+            swprintf_s(message, L"NGX_RELEASE handle=%p result=0x%08X", handle, static_cast<uint32_t>(result));
+            Report(message);
+        }
         if (lease.slot != SIZE_MAX)
         {
             lock.lock();
@@ -1462,6 +1490,16 @@ bool WINAPI ProviderGate(void* arg1, uintptr_t arg2, const void* arg3, void* arg
 #if MFG_UNLOCK_RUNTIME_GPU_SELECTION
     std::unique_lock callLock(gCalls);
     const auto selectedEntry = entry_detour::ReadSnapshot(entry);
+    if (selectedEntry.kind == entry_detour::Kind::eAmpereRelease)
+    {
+        static std::atomic<uint32_t> gateLogs{0};
+        if (gateLogs.fetch_add(1, std::memory_order_relaxed) < 256)
+        {
+            wchar_t message[160]{};
+            swprintf_s(message, L"NGX_PROVIDER_RELEASE handle=%p current=%d", arg1, selectedEntry.current ? 1 : 0);
+            Report(message);
+        }
+    }
     if (selectedEntry.kind == entry_detour::Kind::eNgxD3D12CreateFeature
         && arg2 == NVSDK_NGX_Feature_FrameGeneration)
         ObserveCreateDevice(static_cast<ID3D12GraphicsCommandList*>(arg1));
